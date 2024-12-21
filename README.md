@@ -2,34 +2,36 @@
 Ceph OSD benchmark and analysis scripts
 
 Description:
-   These scripts provide the tools for benchmarking and analyzing 
-   the performance of Ceph OSDs. The Bash script for benchmarking
-   has been developed and tested with Ceph 18.2.2 on RHEL 9.4 and 
-   should be capable of running on a variety of operating systems.
-   The Python3 script dependencies include Numpy, Pandas, & SciPy.
+  These scripts provide the tools for benchmarking and analyzing 
+  the performance of Ceph OSDs. The Bash script for benchmarking
+  has been developed and tested with Ceph 18.2.2 on RHEL 9.4 and 
+  should be capable of running on a variety of operating systems.
+  The Python3 script dependencies include Numpy, Pandas, & SciPy.
 
-   With these scripts you should be able to easily identify OSDs
-   that are underperforming. Note that it's recommended that all
-   of the OSDs in each device class be of the same make and model.
-   Running the benchmark in parallel is preferred as running the
-   tests serially can be very time consuming for mulitple runs.
-   The benchmark will also drop OSD caches before each run so
-   be aware of this if running on a production cluster as this
-   could potentially reduce performance until caches refresh.
+  With these scripts you should be able to easily identify OSDs
+  that are underperforming. Note that it's recommended that all
+  of the OSDs in each device class be of the same make and model.
+  Running the benchmark in parallel is preferred as running the
+  tests serially can be very time consuming for mulitple runs.
+  The benchmark will also drop OSD caches before each run so
+  be aware of this if running on a production cluster as this
+  could potentially reduce performance until caches refresh.
 
    
 Bash script options:
-    -t <type>    Device type to benchmark (hdd|ssd|nvme)
-    -r <number>  Number of benchmark runs (default: 1)
-    -o <file>    Output file name (default: ceph_bench_results_TIMESTAMP.csv)
-    -p           Run benchmarks in parallel
-    -m <mode>    Benchmark mode (bandwidth|iops|balanced)
-    -v           Verbose output
-    -h           Display help message
-
+```
+   -t <type>    Device type to benchmark (hdd|ssd|nvme)
+   -r <number>  Number of benchmark runs (default: 1)
+   -o <file>    Output file name (default: ceph_bench_results_TIMESTAMP.csv)
+   -p           Run benchmarks in parallel
+   -m <mode>    Benchmark mode (bandwidth|iops|balanced)
+   -v           Verbose output
+   -h           Display help message
+```
 Python script options:
-    --threshold  <number> Percentage below median to flag as slow (default: 15)
-     
+```
+   --threshold  <number> Percentage below median to flag as slow (default: 15)
+```     
  Dependencies:
    - bash shell
    - Ceph common packages for your distro
