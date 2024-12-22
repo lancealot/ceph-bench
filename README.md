@@ -6,7 +6,7 @@ Description:
   the performance of Ceph OSDs. The Bash script for benchmarking
   has been developed and tested with Ceph 18.2.2 on RHEL 9.4 and 
   should be capable of running on a variety of operating systems.
-  The Python3 script dependencies include Numpy, Pandas, & SciPy.
+  Python3 dependencies include Numpy, Pandas, & SciPy.
 
   With these scripts you should be able to easily identify OSDs
   that are underperforming. Note that it's recommended that all
