@@ -13,9 +13,8 @@ Description:
   of the OSDs in each device class be of the same make and model.
   Running the benchmark in parallel is preferred as running the
   tests serially can be very time consuming for mulitple runs.
-  The benchmark will also drop OSD caches before each run so
-  be aware of this if running on a production cluster as this
-  could potentially reduce performance until caches refresh.
+  > The benchmark script also drops OSD caches before each run
+  so that each benchmark isn't affected by the previous run.
 
    
 Bash script options:
