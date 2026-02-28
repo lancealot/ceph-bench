@@ -664,7 +664,7 @@ class CephBenchmarks:
             recovery_obj_size = 4194304  # 4M RADOS default
             recovery_data = os.urandom(recovery_obj_size)
             self._print_progress(
-                f"  Recovery (full pipeline) @ {self.config.object_size}...")
+                f"  Recovery (full pipeline) @ 4m (RADOS object size)...")
             if self.config.protection_type == 'erasure':
                 self._bench_recovery_ec(recovery_data)
             else:
@@ -1015,9 +1015,15 @@ class OSDCapacityModel:
         overhead = self._compute_overhead_multiplier()
         max_osds_adjusted = max_osds / overhead
 
+        # Guard against inf from zero IOPS edge case
+        if math.isinf(max_osds_adjusted):
+            max_osds_adjusted_int = 999999
+        else:
+            max_osds_adjusted_int = math.floor(max_osds_adjusted)
+
         result = {
             'max_osds_raw': max_osds,
-            'max_osds_adjusted': math.floor(max_osds_adjusted),
+            'max_osds_adjusted': max_osds_adjusted_int,
             'cpu_us_per_io': total_cpu_us_per_io,
             'cpu_us_per_osd_per_sec': cpu_us_per_osd_per_sec,
             'overhead_multiplier': overhead,
@@ -1078,8 +1084,14 @@ class OSDCapacityModel:
             # must help recover
             recovery_participation = (recovery_osds / surviving_osds)
         else:
-            # EC: need k chunks to reconstruct, all survivors participate
-            recovery_participation = (recovery_osds / surviving_osds)
+            # EC: recovery requires reading k chunks from surviving OSDs
+            # and writing m new parity/data chunks.  The load is spread
+            # across survivors but each operation touches k+m OSDs.
+            ec_width = self.config.ec_k + self.config.ec_m
+            participation_ratio = min(ec_width / surviving_osds, 1.0)
+            recovery_participation = (
+                (recovery_osds / surviving_osds) * participation_ratio
+                * (ec_width / max(self.config.ec_k, 1)))
 
         # Recovery IOPS per surviving OSD (Ceph rate-limits recovery,
         # but default osd_recovery_max_active=3 and
@@ -1324,6 +1336,12 @@ class OSDCapacityModel:
             algo = self.config.compression_algorithm
             compress_c = self._get_cost(f'compress_{algo}')
             decompress_c = self._get_cost(f'decompress_{algo}')
+            # If the configured algorithm wasn't available and we fell back
+            # to a different one, find whatever compression benchmark ran
+            if compress_c == 0.0:
+                compress_c = self._get_cost('compress_')
+            if decompress_c == 0.0:
+                decompress_c = self._get_cost('decompress_')
             comp_cost = ((1 - rw) * p * compress_c +
                          rw * p * decompress_c)
 
@@ -1877,8 +1895,11 @@ class ReportGenerator:
             print("  - Using larger RADOS object sizes")
 
     def export_csv(self, filepath: str):
-        bench_path = filepath.replace('.csv', '_benchmarks.csv')
-        cap_path = filepath.replace('.csv', '_capacity.csv')
+        base, ext = os.path.splitext(filepath)
+        if not ext:
+            ext = '.csv'
+        bench_path = f"{base}_benchmarks{ext}"
+        cap_path = f"{base}_capacity{ext}"
 
         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -1918,6 +1939,16 @@ class ReportGenerator:
                 f"{cap['headroom_percentage']:.1f}"])
         print(f"Capacity estimates saved to: {cap_path}")
 
+    @staticmethod
+    def _json_safe(obj):
+        """Replace inf/nan with JSON-safe values."""
+        if isinstance(obj, float):
+            if math.isinf(obj):
+                return None
+            if math.isnan(obj):
+                return None
+        return obj
+
     def to_json(self) -> str:
         data = {
             'version': VERSION,
@@ -1928,6 +1959,7 @@ class ReportGenerator:
                 'cpu_cores_for_ceph': self.config.cpu_cores_for_ceph,
                 'architecture': platform.machine(),
                 'python_version': platform.python_version(),
+                'os': f'{platform.system()} {platform.release()}',
             },
             'config': {
                 'drive_type': self.config.drive_type,
@@ -1939,8 +1971,23 @@ class ReportGenerator:
                 'ec_m': self.config.ec_m,
                 'compression_enabled': self.config.compression_enabled,
                 'compression_algorithm': self.config.compression_algorithm,
+                'compression_mode': self.config.compression_mode,
+                'compression_ratio': self.config.compression_ratio,
                 'object_size': self.config.object_size,
                 'scenario': self.config.scenario,
+                'workload_pattern': self.config.workload_pattern,
+                'read_write_ratio': self.config.read_write_ratio,
+                'scrub_frequency': self.config.scrub_frequency,
+                'wal_db_separate': self.config.wal_db_separate,
+            },
+            'libraries': {
+                'crc32c': self.libs.available.get('crc32c', 'N/A'),
+                'lz4': self.libs.available.get('lz4', 'N/A'),
+                'zstd': self.libs.available.get('zstd', 'N/A'),
+                'snappy': self.libs.available.get('snappy', 'N/A'),
+                'erasure_coding': self.libs.available.get(
+                    'erasure_coding', 'N/A'),
+                'rocksdb': self.libs.available.get('rocksdb', 'N/A'),
             },
             'benchmarks': [
                 {
@@ -1949,7 +1996,11 @@ class ReportGenerator:
                     'ops_per_sec': round(r.ops_per_sec, 2),
                     'cpu_time_per_op_us': round(r.cpu_time_per_op_us, 2),
                     'throughput_mbps': round(r.throughput_mbps, 2),
+                    'cpu_utilization': round(r.cpu_utilization, 4),
+                    'iterations': r.iterations,
+                    'elapsed_sec': round(r.elapsed_sec, 3),
                     'library_used': r.library_used,
+                    'notes': r.notes,
                 }
                 for r in self.bench_results
             ],
@@ -1957,10 +2008,19 @@ class ReportGenerator:
                 'max_osds_raw': round(self.capacity['max_osds_raw'], 2),
                 'max_osds_adjusted': self.capacity['max_osds_adjusted'],
                 'cpu_us_per_io': round(self.capacity['cpu_us_per_io'], 2),
+                'cpu_us_per_osd_per_sec': round(
+                    self.capacity['cpu_us_per_osd_per_sec'], 2),
+                'available_cpu_us': self.capacity['available_cpu_us'],
+                'drive_iops': self.capacity['drive_iops'],
                 'overhead_multiplier': round(
                     self.capacity['overhead_multiplier'], 2),
                 'headroom_percentage': round(
                     self.capacity['headroom_percentage'], 1),
+                'per_operation_costs': {
+                    k: round(v, 2)
+                    for k, v in self.capacity.get(
+                        'per_operation_costs', {}).items()
+                },
             },
             'scale_out': self.scale_out,
         }
@@ -1968,7 +2028,19 @@ class ReportGenerator:
             data['recovery'] = self.capacity['recovery']
         if 'cpu_scaling' in self.capacity:
             data['cpu_scaling'] = self.capacity['cpu_scaling']
-        return json.dumps(data, indent=2)
+
+        # Replace inf/nan with null for valid JSON
+        def sanitize(obj):
+            if isinstance(obj, dict):
+                return {k: sanitize(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [sanitize(v) for v in obj]
+            if isinstance(obj, float):
+                if math.isinf(obj) or math.isnan(obj):
+                    return None
+            return obj
+
+        return json.dumps(sanitize(data), indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -2031,13 +2103,14 @@ def compare_with_real(csv_path: str, config: ClusterConfig,
 
         cpu_us_per_io = capacity['cpu_us_per_io']
         available_cpu_us = capacity['available_cpu_us']
+        overhead = capacity.get('overhead_multiplier', 1.0)
 
         for dc, data in sorted(device_classes.items()):
             if not data['iops']:
                 continue
             avg_iops = sum(data['iops']) / len(data['iops'])
             osd_count = len(data['osds'])
-            real_cpu_per_osd = cpu_us_per_io * avg_iops
+            real_cpu_per_osd = cpu_us_per_io * avg_iops * overhead
             if real_cpu_per_osd > 0:
                 real_max_osds = available_cpu_us / real_cpu_per_osd
             else:
@@ -2239,7 +2312,8 @@ Examples:
     mode.add_argument('--interactive', '-i', action='store_true',
                       help='Interactive guided configuration')
     mode.add_argument('--quick', action='store_true',
-                      help='Quick benchmark with sensible defaults')
+                      help='Quick benchmark (2s duration, fewer sizes). '
+                           'Other CLI flags are still honored')
 
     cpu = parser.add_argument_group('CPU Configuration')
     cpu.add_argument('--cpu-cores', type=int, default=0,
@@ -2255,11 +2329,13 @@ Examples:
     drive.add_argument('--drive-count', '-d', type=int, default=12,
                        help='Drives per node (default: 12)')
     drive.add_argument('--drive-iops', type=int, default=0,
-                       help='Override drive IOPS (0=use profile default)')
+                       help='Override drive IOPS (0=use profile: '
+                            'HDD=150, SSD=50K, NVMe=500K typical)')
 
     prot = parser.add_argument_group('Data Protection')
     prot.add_argument('--protection', '-p', default='replicated:3',
-                      help='Protection: replicated:N or ec:K+M '
+                      help='Protection: replicated:N (N=replica count) or '
+                           'ec:K+M (K=data, M=parity chunks) '
                            '(default: replicated:3)')
 
     comp = parser.add_argument_group('Compression')
@@ -2267,10 +2343,13 @@ Examples:
                       choices=['snappy', 'zstd', 'lz4', 'zlib'],
                       help='Enable compression with specified algorithm')
     comp.add_argument('--compress-ratio', type=float, default=0.5,
-                      help='Expected compression ratio (default: 0.5)')
+                      help='Expected compression ratio: 0.5 means data '
+                           'compresses to 50%% of original (default: 0.5)')
     comp.add_argument('--compress-mode', default='passive',
                       choices=['passive', 'aggressive', 'force'],
-                      help='Compression mode (default: passive)')
+                      help='Compression mode: passive=only if beneficial, '
+                           'aggressive=try more objects, force=always '
+                           '(default: passive)')
 
     bs = parser.add_argument_group('BlueStore')
     bs.add_argument('--wal-db-separate', action='store_true',
@@ -2282,16 +2361,21 @@ Examples:
     wl = parser.add_argument_group('Workload')
     wl.add_argument('--workload', default='mixed',
                     choices=['sequential', 'random', 'mixed'],
-                    help='Workload pattern (default: mixed)')
+                    help='Workload pattern (default: mixed). Note: CPU cost '
+                         'model uses random IOPS; sequential workloads have '
+                         'lower CPU cost per byte in practice')
     wl.add_argument('--rw-ratio', type=float, default=0.7,
-                    help='Read/write ratio 0.0-1.0 (default: 0.7)')
+                    help='Read/write ratio: 0.0=all writes, 1.0=all reads '
+                         '(default: 0.7)')
     wl.add_argument('--scrub', default='daily',
                     choices=['daily', 'weekly', 'disabled'],
                     help='Scrub frequency (default: daily)')
 
     parser.add_argument('--scenario', '-s', default='typical',
                         choices=['best', 'worst', 'typical', 'all'],
-                        help='Scenario (default: typical)')
+                        help='Scenario: best=lowest IOPS/overhead, '
+                             'worst=highest IOPS/overhead, '
+                             'all=run all three (default: typical)')
 
     rec = parser.add_argument_group('Recovery Simulation')
     rec.add_argument('--recovery-osds', type=int, default=0,
@@ -2300,7 +2384,8 @@ Examples:
 
     out = parser.add_argument_group('Output')
     out.add_argument('--output', '-o', default=None,
-                     help='CSV output file')
+                     help='CSV output base file (creates '
+                          '*_benchmarks.csv and *_capacity.csv)')
     out.add_argument('--compare', default=None,
                      help='Compare with ceph-bench.sh CSV results')
     out.add_argument('--json', action='store_true',
@@ -2312,7 +2397,8 @@ Examples:
     bench.add_argument('--sizes', nargs='+',
                        default=['4k', '64k', '128k', '4m'],
                        choices=list(OBJECT_SIZES.keys()),
-                       help='Object sizes to test '
+                       help='Object sizes for micro-benchmarks. '
+                            'The --object-size value is auto-added '
                             '(default: 4k 64k 128k 4m)')
 
     parser.add_argument('--verbose', '-v', action='store_true',
@@ -2326,18 +2412,90 @@ Examples:
 def parse_protection(spec: str) -> Tuple[str, int, int, int]:
     """Parse protection spec like 'replicated:3' or 'ec:4+2'."""
     spec = spec.strip().lower()
-    if spec.startswith('replicated'):
-        parts = spec.split(':')
-        count = int(parts[1]) if len(parts) > 1 else 3
-        return 'replicated', count, 0, 0
-    elif spec.startswith('ec'):
-        parts = spec.split(':')
-        if len(parts) > 1:
-            km = parts[1].split('+')
-            k = int(km[0])
-            m = int(km[1]) if len(km) > 1 else 2
-            return 'erasure', 0, k, m
+    try:
+        if spec.startswith('replicated'):
+            parts = spec.split(':')
+            count = int(parts[1]) if len(parts) > 1 else 3
+            if count < 1:
+                print(f"Warning: replica count must be >= 1, using 3")
+                count = 3
+            return 'replicated', count, 0, 0
+        elif spec.startswith('ec'):
+            parts = spec.split(':')
+            if len(parts) > 1:
+                km = parts[1].split('+')
+                k = int(km[0])
+                m = int(km[1]) if len(km) > 1 else 2
+                if k < 1:
+                    print(f"Error: EC k (data chunks) must be >= 1, got {k}")
+                    sys.exit(1)
+                if m < 1:
+                    print(f"Error: EC m (parity chunks) must be >= 1, got {m}")
+                    sys.exit(1)
+                return 'erasure', 0, k, m
+    except (ValueError, IndexError) as e:
+        print(f"Error: Invalid protection spec '{spec}': {e}")
+        sys.exit(1)
     return 'replicated', 3, 0, 0
+
+
+def _validate_config(config: ClusterConfig):
+    """Validate configuration values and exit with helpful errors."""
+    errors = []
+
+    if config.drive_count < 1:
+        errors.append("--drive-count must be >= 1")
+
+    if config.drive_iops < 0:
+        errors.append("--drive-iops must be >= 0")
+
+    if not 0.0 <= config.read_write_ratio <= 1.0:
+        errors.append(
+            f"--rw-ratio must be between 0.0 and 1.0, got "
+            f"{config.read_write_ratio}")
+
+    if config.compression_enabled:
+        if not 0.0 <= config.compression_ratio <= 1.0:
+            errors.append(
+                f"--compress-ratio must be between 0.0 and 1.0, got "
+                f"{config.compression_ratio}")
+
+    if config.benchmark_duration <= 0:
+        errors.append("--duration must be > 0")
+
+    if config.recovery_osds < 0:
+        errors.append("--recovery-osds must be >= 0")
+
+    if config.recovery_osds > 0 and config.recovery_osds >= config.drive_count:
+        errors.append(
+            f"--recovery-osds ({config.recovery_osds}) must be less than "
+            f"--drive-count ({config.drive_count}); "
+            f"losing all OSDs means the cluster is down")
+
+    # Ensure --object-size is included in --sizes for accurate capacity modeling
+    if config.object_size not in config.object_sizes_to_test:
+        config.object_sizes_to_test.append(config.object_size)
+        print(f"Note: Added {config.object_size} to benchmark sizes "
+              f"(required for capacity modeling)")
+
+    if errors:
+        for e in errors:
+            print(f"Error: {e}")
+        sys.exit(1)
+
+    # Non-fatal warnings (only after passing validation)
+    if config.recovery_osds > 0:
+        if (config.protection_type == 'replicated' and
+                config.recovery_osds >= config.replica_count):
+            print(f"Warning: losing {config.recovery_osds} OSDs with "
+                  f"replicated:{config.replica_count} means some data is "
+                  f"unrecoverable. Modeling recovery of salvageable PGs.")
+        elif (config.protection_type == 'erasure' and
+              config.recovery_osds > config.ec_m):
+            print(f"Warning: losing {config.recovery_osds} OSDs with "
+                  f"EC {config.ec_k}+{config.ec_m} exceeds parity tolerance. "
+                  f"Some data is unrecoverable. Modeling recovery of "
+                  f"salvageable PGs.")
 
 
 def build_config_from_args(args) -> ClusterConfig:
@@ -2370,6 +2528,8 @@ def build_config_from_args(args) -> ClusterConfig:
     config.benchmark_duration = args.duration
     config.object_sizes_to_test = args.sizes
 
+    _validate_config(config)
+
     return config
 
 
@@ -2385,9 +2545,12 @@ def main():
     if args.interactive:
         config = interactive_config()
     elif args.quick:
-        config = ClusterConfig()
+        config = build_config_from_args(args)
         config.benchmark_duration = 2.0
         config.object_sizes_to_test = ['4k', '4m']
+        # Ensure capacity modeling size is included
+        if config.object_size not in config.object_sizes_to_test:
+            config.object_sizes_to_test.append(config.object_size)
     else:
         config = build_config_from_args(args)
 
@@ -2401,18 +2564,22 @@ def main():
     scenarios = (['best', 'worst', 'typical'] if config.scenario == 'all'
                  else [config.scenario])
 
-    all_results = []
+    # Run benchmarks once -- scenario only affects the capacity model, not
+    # the raw CPU micro-benchmarks.  Reuse results across scenarios.
+    if not args.json:
+        print(f"\n{'=' * 60}")
+        print(f"  Running benchmarks...")
+        print(f"{'=' * 60}")
+    else:
+        print("Running benchmarks...", file=sys.stderr)
+    benchmarks = CephBenchmarks(libs, config, verbose=args.verbose)
+    results = benchmarks.run_all()
+
     all_capacities = []
+    json_documents = []
 
     for scenario in scenarios:
         config.scenario = scenario
-
-        print(f"\n{'=' * 60}")
-        print(f"  Running benchmarks (scenario: {scenario})...")
-        print(f"{'=' * 60}")
-
-        benchmarks = CephBenchmarks(libs, config, verbose=args.verbose)
-        results = benchmarks.run_all()
 
         model = OSDCapacityModel(config, results)
         capacity = model.calculate()
@@ -2423,16 +2590,26 @@ def main():
         report = ReportGenerator(config, libs, results, capacity, scale_out)
 
         if args.json:
-            print(report.to_json())
+            json_documents.append(json.loads(report.to_json()))
         else:
             report.print_report()
 
-        output_file = args.output or (
-            f"ceph_cpu_sim_{datetime.now():%Y%m%d_%H%M%S}_{scenario}.csv")
-        report.export_csv(output_file)
+        if args.output:
+            if len(scenarios) > 1:
+                base, ext = os.path.splitext(args.output)
+                output_file = f"{base}_{scenario}{ext}"
+            else:
+                output_file = args.output
+            report.export_csv(output_file)
 
-        all_results.extend(results)
         all_capacities.append(capacity)
+
+    # Emit valid JSON: single object or array depending on scenario count
+    if args.json:
+        if len(json_documents) == 1:
+            print(json.dumps(json_documents[0], indent=2))
+        else:
+            print(json.dumps(json_documents, indent=2))
 
     if args.compare and all_capacities:
         compare_with_real(args.compare, config, all_capacities[-1])
