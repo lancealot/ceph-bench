@@ -1031,6 +1031,9 @@ class OSDCapacityModel:
             result['recovery'] = self._compute_recovery_impact(
                 total_cpu_us_per_io, available_cpu_us, drive_iops, overhead)
 
+        result['cpu_scaling'] = self._compute_cpu_scaling(
+            total_cpu_us_per_io, drive_iops, overhead)
+
         return result
 
     def _compute_recovery_impact(self, normal_cpu_per_io: float,
@@ -1144,6 +1147,150 @@ class OSDCapacityModel:
             'client_io_fraction': client_iops_fraction,
             'client_iops_degraded': int(drive_iops * client_iops_fraction),
             'est_recovery_time_hours': recovery_time_hours,
+        }
+
+    def _compute_cpu_scaling(self, cpu_us_per_io: float,
+                             drive_iops: int,
+                             overhead: float) -> Dict[str, Any]:
+        """Analyze whether more cores or faster cores would help more.
+
+        Determines the dominant CPU cost (serialized single-threaded work vs
+        parallelizable work) and computes how many cores are needed at
+        various target configurations.
+        """
+        drives = self.config.drive_count
+        costs = dict(self._cpu_costs)
+
+        # Cores needed to support all configured drives
+        cpu_per_osd_per_sec = cpu_us_per_io * drive_iops
+        if cpu_per_osd_per_sec > 0:
+            cores_needed_all_drives = (
+                drives * cpu_per_osd_per_sec * overhead / 1_000_000)
+        else:
+            cores_needed_all_drives = 0.0
+
+        # Cores needed with 20% headroom (recommended minimum)
+        cores_with_headroom = cores_needed_all_drives * 1.20
+
+        # Cores needed during recovery (if recovery data available)
+        cores_recovery = 0.0
+        recovery_data = None
+        for r in self.results:
+            if r.operation.startswith('recovery_'):
+                recovery_data = r
+                break
+        if recovery_data and self.config.recovery_osds > 0:
+            recovery_ops_per_osd = {
+                'hdd': 50, 'ssd': 200, 'nvme': 500,
+            }.get(self.config.drive_type, 50)
+            surviving = max(drives - self.config.recovery_osds, 1)
+            recovery_participation = self.config.recovery_osds / surviving
+            recovery_cpu_per_osd = (recovery_data.cpu_time_per_op_us *
+                                    recovery_ops_per_osd *
+                                    recovery_participation)
+            total_per_osd_recovery = cpu_per_osd_per_sec + recovery_cpu_per_osd
+            cores_recovery = (
+                surviving * total_per_osd_recovery * overhead / 1_000_000)
+
+        # Identify the dominant cost component
+        weighted_costs = {
+            'checksumming': costs.get('_crc32c_weighted', 0),
+            'compression': costs.get('_compression_weighted', 0),
+            'data_protection': costs.get('_protection_weighted', 0),
+            'metadata': costs.get('_rocksdb_weighted', 0),
+            'crush': costs.get('_crush_weighted', 0),
+            'scrub': costs.get('_scrub_weighted', 0),
+        }
+        total_weighted = sum(weighted_costs.values())
+        if total_weighted <= 0:
+            total_weighted = 1.0
+
+        dominant_op = max(weighted_costs, key=weighted_costs.get)
+        dominant_pct = weighted_costs[dominant_op] / total_weighted * 100
+
+        # Determine if workload benefits more from clock speed or core count
+        #
+        # Ceph OSD threads are largely independent per-OSD. Within a single
+        # OSD, the IO path is pipelined but individual operations (CRC,
+        # compress, EC encode) run on a single core. So:
+        #
+        # - More cores: helps when you have many OSDs per node and each OSD
+        #   needs its own CPU budget. The total cluster throughput scales
+        #   linearly with core count.
+        #
+        # - Faster cores: helps when per-IO latency is the bottleneck.
+        #   Operations like CRC32C, compression, and EC encode are
+        #   single-threaded within an OSD. Faster cores reduce per-IO
+        #   latency, which matters for latency-sensitive workloads and
+        #   for NVMe drives where the CPU can't keep up with drive speed.
+        #
+        # Key heuristic: if cpu_us_per_io is high relative to drive latency,
+        # the CPU adds significant latency and faster cores help. If the
+        # node just needs more total throughput across many OSDs, more
+        # cores help.
+
+        drive_latency_us = DRIVE_PROFILES[self.config.drive_type][
+            'latency_ms'] * 1000
+        cpu_latency_ratio = cpu_us_per_io / drive_latency_us if drive_latency_us > 0 else 0
+
+        # Classify the bottleneck
+        # If CPU time per IO exceeds drive latency, CPU adds meaningful
+        # latency to every IO -> faster cores help
+        # If we just need more total throughput -> more cores help
+        if cpu_latency_ratio > 1.0:
+            speed_benefit = 'high'
+        elif cpu_latency_ratio > 0.3:
+            speed_benefit = 'moderate'
+        else:
+            speed_benefit = 'low'
+
+        current_cores = self.config.cpu_cores_for_ceph
+        cores_per_osd = (cpu_per_osd_per_sec * overhead / 1_000_000
+                         if cpu_per_osd_per_sec > 0 else 0)
+
+        # Projected core counts at different clock speed improvements
+        # (faster clock linearly reduces cpu_us_per_io)
+        speed_projections = {}
+        for label, factor in [('1.25x faster', 1.25),
+                              ('1.5x faster', 1.5),
+                              ('2x faster', 2.0)]:
+            scaled_cpu = cpu_us_per_io / factor
+            scaled_per_osd = scaled_cpu * drive_iops * overhead / 1_000_000
+            if scaled_per_osd > 0:
+                max_osds_scaled = current_cores / scaled_per_osd
+            else:
+                max_osds_scaled = float('inf')
+            speed_projections[label] = {
+                'cores_per_osd': scaled_per_osd,
+                'max_osds': math.floor(max_osds_scaled),
+                'cores_for_all_drives': drives * scaled_per_osd,
+            }
+
+        # Projected capacity at different core counts
+        core_projections = {}
+        for extra in [4, 8, 16, 32]:
+            total = current_cores + extra
+            if cores_per_osd > 0:
+                max_osds_at_count = total / cores_per_osd
+            else:
+                max_osds_at_count = float('inf')
+            core_projections[f'+{extra} cores ({total:.0f} total)'] = {
+                'max_osds': math.floor(max_osds_at_count),
+                'supports_all_drives': math.floor(max_osds_at_count) >= drives,
+            }
+
+        return {
+            'cores_needed_all_drives': cores_needed_all_drives,
+            'cores_with_headroom': cores_with_headroom,
+            'cores_recovery': cores_recovery,
+            'cores_per_osd': cores_per_osd,
+            'dominant_operation': dominant_op,
+            'dominant_percentage': dominant_pct,
+            'cpu_latency_ratio': cpu_latency_ratio,
+            'speed_benefit': speed_benefit,
+            'speed_projections': speed_projections,
+            'core_projections': core_projections,
+            'drive_latency_us': drive_latency_us,
         }
 
     def _compute_per_io_cpu_cost(self):
@@ -1360,6 +1507,7 @@ class ReportGenerator:
         self._print_scale_out_table()
         if 'recovery' in self.capacity:
             self._print_recovery_analysis()
+        self._print_cpu_scaling_advice()
         self._print_recommendations()
 
     def _print_header(self):
@@ -1574,6 +1722,118 @@ class ReportGenerator:
             print("!! CAUTION: Client IO reduced to "
                   f"{client_pct:.0f}% during recovery.")
 
+    def _print_cpu_scaling_advice(self):
+        scaling = self.capacity.get('cpu_scaling')
+        if not scaling:
+            return
+
+        cap = self.capacity
+        drives = self.config.drive_count
+        current_cores = self.config.cpu_cores_for_ceph
+        max_osds = cap['max_osds_adjusted']
+
+        print()
+        print("=" * 60)
+        print("  CPU Scaling Analysis")
+        print("=" * 60)
+
+        # Current state
+        print(f"Current CPU:           "
+              f"{current_cores:.0f} cores for Ceph")
+        print(f"CPU per OSD:           "
+              f"{scaling['cores_per_osd']:.2f} cores/OSD")
+        print(f"Cores for {drives} drives:  "
+              f"{scaling['cores_needed_all_drives']:.1f} cores "
+              f"(+20% headroom: {scaling['cores_with_headroom']:.1f})")
+        if scaling['cores_recovery'] > 0:
+            print(f"Cores during recovery: "
+                  f"{scaling['cores_recovery']:.1f} cores")
+
+        # Dominant operation analysis
+        print()
+        print("--- Cost Breakdown ---")
+        dom_op = scaling['dominant_operation']
+        dom_pct = scaling['dominant_percentage']
+        dom_labels = {
+            'checksumming': 'Checksumming (CRC32C)',
+            'compression': 'Compression/decompression',
+            'data_protection': 'Data protection (replication/EC)',
+            'metadata': 'Metadata (RocksDB)',
+            'crush': 'CRUSH placement',
+            'scrub': 'Scrub',
+        }
+        print(f"Dominant CPU cost:     {dom_labels.get(dom_op, dom_op)} "
+              f"({dom_pct:.0f}% of per-IO cost)")
+
+        # More cores vs faster cores
+        print()
+        print("--- More Cores vs Faster Cores ---")
+        ratio = scaling['cpu_latency_ratio']
+        drive_lat = scaling['drive_latency_us']
+        cpu_per_io = cap['cpu_us_per_io']
+        benefit = scaling['speed_benefit']
+
+        print(f"CPU time per IO:       {cpu_per_io:,.1f} us")
+        print(f"Drive latency:         {drive_lat:,.1f} us "
+              f"({self.config.drive_type.upper()})")
+        print(f"CPU/drive ratio:       {ratio:.2f}x")
+
+        if benefit == 'high':
+            print()
+            print(">> FASTER CORES recommended.")
+            print("   CPU time per IO exceeds drive latency -- the CPU adds")
+            print("   significant latency to every operation. Higher clock")
+            print("   speed directly reduces per-IO latency.")
+            if dom_op == 'data_protection':
+                print("   Data protection (replication/EC serialization) is the")
+                print("   dominant cost. This scales linearly with clock speed.")
+            elif dom_op == 'checksumming':
+                print("   CRC32C checksumming dominates. CPUs with dedicated")
+                print("   CRC32C instructions (SSE4.2) give ~10x improvement.")
+            elif dom_op == 'compression':
+                print("   Compression dominates. Faster cores and/or switching")
+                print("   to a lighter algorithm (lz4 vs zstd) would help.")
+        elif benefit == 'moderate':
+            print()
+            print(">> BOTH faster cores and more cores would help.")
+            print("   CPU time is a meaningful fraction of drive latency.")
+            print("   More cores lets you run more OSDs; faster cores")
+            print("   reduce per-IO latency for each OSD.")
+        else:
+            print()
+            print(">> MORE CORES recommended over faster cores.")
+            print("   CPU time per IO is small relative to drive latency.")
+            print("   The drive is the latency bottleneck, not CPU.")
+            print("   Adding cores lets you run more OSDs per node.")
+
+        # Core count projections table
+        print()
+        print("--- Adding More Cores ---")
+        header = f"{'Configuration':<30} {'Max OSDs':>10} {'Supports All':>13}"
+        print(header)
+        print("-" * len(header))
+        print(f"{'Current (' + f'{current_cores:.0f} cores)':<30} "
+              f"{max_osds:>10} "
+              f"{'YES' if max_osds >= drives else 'no':>13}")
+        for label, proj in scaling['core_projections'].items():
+            support = 'YES' if proj['supports_all_drives'] else 'no'
+            print(f"{label:<30} {proj['max_osds']:>10} {support:>13}")
+
+        # Clock speed projections table
+        print()
+        print("--- Faster Clock Speed ---")
+        header = (f"{'Clock Speed':<20} {'Cores/OSD':>10} "
+                  f"{'Max OSDs':>10} {'For All Drives':>15}")
+        print(header)
+        print("-" * len(header))
+        print(f"{'Current':<20} {scaling['cores_per_osd']:>10.2f} "
+              f"{max_osds:>10} "
+              f"{scaling['cores_needed_all_drives']:>14.1f}")
+        for label, proj in scaling['speed_projections'].items():
+            print(f"{label:<20} {proj['cores_per_osd']:>10.2f} "
+                  f"{proj['max_osds']:>10} "
+                  f"{proj['cores_for_all_drives']:>14.1f}")
+
     def _print_recommendations(self):
         cap = self.capacity
         print()
@@ -1706,6 +1966,8 @@ class ReportGenerator:
         }
         if 'recovery' in self.capacity:
             data['recovery'] = self.capacity['recovery']
+        if 'cpu_scaling' in self.capacity:
+            data['cpu_scaling'] = self.capacity['cpu_scaling']
         return json.dumps(data, indent=2)
 
 
