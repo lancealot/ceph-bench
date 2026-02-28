@@ -572,6 +572,8 @@ class ClusterConfig:
 
     wal_db_separate: bool = False
 
+    recovery_osds: int = 0
+
     object_size: str = '4m'
     workload_pattern: str = 'mixed'
     read_write_ratio: float = 0.7
@@ -655,6 +657,18 @@ class CephBenchmarks:
 
         self._print_progress("  CRUSH calculation...")
         self._bench_crush_calculation()
+
+        if self.config.recovery_osds > 0:
+            # Recovery always operates on full RADOS objects (typically 4M),
+            # not at the IO size used for normal operations
+            recovery_obj_size = 4194304  # 4M RADOS default
+            recovery_data = os.urandom(recovery_obj_size)
+            self._print_progress(
+                f"  Recovery (full pipeline) @ {self.config.object_size}...")
+            if self.config.protection_type == 'erasure':
+                self._bench_recovery_ec(recovery_data)
+            else:
+                self._bench_recovery_replicated(recovery_data)
 
         return self.results
 
@@ -861,6 +875,106 @@ class CephBenchmarks:
             'crush_calculation', op, 0, 'simulation',
             notes=f'{placements} placements across {num_osds} OSDs')
 
+    def _bench_recovery_replicated(self, data: bytes):
+        """Benchmark full replicated recovery pipeline per object.
+
+        Recovery for a replicated pool requires:
+        1. Read object from surviving replica (CRC32C verify)
+        2. Serialize for network (CRC32C header + payload)
+        3. Write to new OSD location (CRC32C for BlueStore)
+        4. RocksDB metadata updates on source and destination OSDs
+        5. CRUSH recalculation for new PG mapping
+        """
+        crc_fn = self.libs.crc32c
+        obj_size = len(data)
+        store = {}
+        counter = [0]
+
+        def op():
+            # 1. Read from surviving OSD: verify CRC
+            crc_fn(data)
+            # 2. Serialize replication message: header + CRC of payload
+            header = struct.pack('<IIQQQII',
+                                 0x0002, obj_size, 0x12345678,
+                                 0, obj_size, 42, 0)
+            crc_fn(header)
+            crc_fn(data)
+            # 3. Write to new OSD: CRC for BlueStore
+            crc_fn(data)
+            # 4. RocksDB metadata on source (mark PG migrating) +
+            #    destination (new object entry) = ~6 KV ops total
+            for i in range(6):
+                k = struct.pack('>QQ', counter[0], i)
+                v = struct.pack('<QQII', counter[0] * obj_size,
+                                obj_size, 0, zlib.crc32(k))
+                store[k] = v
+            counter[0] += 1
+            # 5. CRUSH lookup for new placement
+            pg_id = struct.unpack('<I', data[:4])[0]
+            for rep in range(self.config.replica_count):
+                best = -1
+                for osd in range(max(self.config.drive_count * 8, 64)):
+                    h = zlib.crc32(struct.pack('<III', pg_id, osd, rep))
+                    if h > best:
+                        best = h
+
+        self._run_timed(
+            'recovery_replicated', op, obj_size,
+            self.libs.available.get('crc32c', 'zlib'),
+            notes=f'full pipeline: read+verify+serialize+write+metadata+CRUSH')
+
+    def _bench_recovery_ec(self, data: bytes):
+        """Benchmark full EC recovery pipeline per object.
+
+        Recovery for an EC pool requires:
+        1. Read k chunks from surviving OSDs (CRC32C each)
+        2. EC decode to reconstruct missing chunk(s)
+        3. EC re-encode to generate new parity if needed
+        4. CRC32C the recovered chunk for BlueStore write
+        5. RocksDB metadata updates (~8 KV ops: source PG states +
+           destination extent maps)
+        6. CRUSH recalculation
+        """
+        crc_fn = self.libs.crc32c
+        k, m = self.config.ec_k, self.config.ec_m
+        chunks = self.libs.ec_encode(data, k, m)
+        missing = [0]
+        obj_size = len(data)
+        store = {}
+        counter = [0]
+
+        def op():
+            # 1. Read k chunks from surviving OSDs, CRC each
+            for i in range(k + m):
+                if i not in missing and i < len(chunks):
+                    crc_fn(chunks[i])
+            # 2. EC decode (reconstruct missing)
+            self.libs.ec_decode(chunks, k, m, missing)
+            # 3. EC re-encode (rebuild parity)
+            self.libs.ec_encode(data, k, m)
+            # 4. CRC the recovered chunk for BlueStore
+            crc_fn(chunks[0])
+            # 5. RocksDB metadata (~8 KV ops for recovery)
+            for i in range(8):
+                key = struct.pack('>QQ', counter[0], i)
+                val = struct.pack('<QQII', counter[0] * obj_size,
+                                  obj_size, 0, zlib.crc32(key))
+                store[key] = val
+            counter[0] += 1
+            # 6. CRUSH for new placement
+            pg_id = struct.unpack('<I', data[:4])[0]
+            for rep in range(k + m):
+                best = -1
+                for osd in range(max(self.config.drive_count * 8, 64)):
+                    h = zlib.crc32(struct.pack('<III', pg_id, osd, rep))
+                    if h > best:
+                        best = h
+
+        self._run_timed(
+            'recovery_ec', op, obj_size,
+            self.libs.available.get('erasure_coding', 'xor'),
+            notes=f'full pipeline: read_k+decode+re-encode+verify+metadata+CRUSH')
+
     @staticmethod
     def _generate_compressible_data(size: int, ratio: float) -> bytes:
         random_fraction = min(ratio * 1.5, 1.0)
@@ -901,7 +1015,7 @@ class OSDCapacityModel:
         overhead = self._compute_overhead_multiplier()
         max_osds_adjusted = max_osds / overhead
 
-        return {
+        result = {
             'max_osds_raw': max_osds,
             'max_osds_adjusted': math.floor(max_osds_adjusted),
             'cpu_us_per_io': total_cpu_us_per_io,
@@ -911,6 +1025,125 @@ class OSDCapacityModel:
             'available_cpu_us': available_cpu_us,
             'per_operation_costs': dict(self._cpu_costs),
             'headroom_percentage': self._compute_headroom(max_osds_adjusted),
+        }
+
+        if self.config.recovery_osds > 0:
+            result['recovery'] = self._compute_recovery_impact(
+                total_cpu_us_per_io, available_cpu_us, drive_iops, overhead)
+
+        return result
+
+    def _compute_recovery_impact(self, normal_cpu_per_io: float,
+                                  available_cpu_us: float,
+                                  drive_iops: int,
+                                  overhead: float) -> Dict[str, Any]:
+        """Model CPU impact during OSD recovery.
+
+        When an OSD fails, its PGs are redistributed. The surviving OSDs
+        must:
+        - Continue serving normal client IO
+        - Additionally perform recovery IO (read + reconstruct + write)
+
+        Recovery IO competes with client IO for CPU. The recovery CPU cost
+        per object is higher than normal IO because it involves the full
+        pipeline (read all replicas/chunks, verify, reconstruct, write,
+        update metadata).
+        """
+        recovery_osds = self.config.recovery_osds
+        total_osds = self.config.drive_count
+
+        # Get the recovery benchmark result
+        recovery_key = ('recovery_ec' if self.config.protection_type == 'erasure'
+                        else 'recovery_replicated')
+        recovery_cpu_per_obj = self._get_cost(recovery_key)
+        if recovery_cpu_per_obj <= 0:
+            recovery_cpu_per_obj = normal_cpu_per_io * 3  # rough estimate
+
+        # PGs affected by the failed OSD(s)
+        # In a cluster with N OSDs and 3x replication, each OSD holds
+        # ~1/N of all PGs. When an OSD dies, those PGs need recovery.
+        # The recovery work is spread across the remaining OSDs.
+        surviving_osds = max(total_osds - recovery_osds, 1)
+
+        # Each surviving OSD gets a share of the recovery work.
+        # With replication, each PG recovery involves replica_count-1
+        # surviving OSDs (one reads, others write). With EC, k OSDs read
+        # and 1+ write.
+        if self.config.protection_type == 'replicated':
+            # Each OSD participates in recovery for PGs it hosts
+            # Recovery load factor: fraction of PGs each surviving OSD
+            # must help recover
+            recovery_participation = (recovery_osds / surviving_osds)
+        else:
+            # EC: need k chunks to reconstruct, all survivors participate
+            recovery_participation = (recovery_osds / surviving_osds)
+
+        # Recovery IOPS per surviving OSD (Ceph rate-limits recovery,
+        # but default osd_recovery_max_active=3 and
+        # osd_max_backfills=1 per OSD)
+        # At typical settings, each OSD does ~50-200 recovery ops/sec
+        # for HDD, more for SSD/NVMe
+        recovery_ops_per_sec = {
+            'hdd': 50,
+            'ssd': 200,
+            'nvme': 500,
+        }.get(self.config.drive_type, 50)
+
+        # Scale by how many failed OSDs' PGs this OSD must help with
+        effective_recovery_ops = recovery_ops_per_sec * recovery_participation
+
+        # Total CPU cost per surviving OSD per second during recovery:
+        # normal IO + recovery IO
+        normal_cpu_per_osd = normal_cpu_per_io * drive_iops
+        recovery_cpu_per_osd = recovery_cpu_per_obj * effective_recovery_ops
+        total_cpu_per_osd = normal_cpu_per_osd + recovery_cpu_per_osd
+
+        # Max OSDs during recovery
+        if total_cpu_per_osd > 0:
+            max_osds_recovery = available_cpu_us / (total_cpu_per_osd * overhead)
+        else:
+            max_osds_recovery = float('inf')
+
+        # Client IO degradation: what fraction of CPU is left for client IO
+        # after recovery takes its share
+        recovery_cpu_fraction = (
+            recovery_cpu_per_osd / (normal_cpu_per_osd + recovery_cpu_per_osd)
+            if (normal_cpu_per_osd + recovery_cpu_per_osd) > 0 else 0)
+
+        client_iops_fraction = 1.0 - recovery_cpu_fraction
+
+        # Time to recover (rough estimate)
+        # Recovery operates on full RADOS objects (4M default), not IO size.
+        # Object count depends on drive capacity and RADOS object size.
+        # A 4TB HDD with 4M RADOS objects at 70% usage: ~750K objects
+        drive_capacity_tb = {'hdd': 4, 'ssd': 2, 'nvme': 2}.get(
+            self.config.drive_type, 4)
+        rados_obj_size = 4194304  # 4M RADOS default
+        objects_per_osd = int(
+            drive_capacity_tb * 1024 * 1024 * 1024 * 1024 * 0.7
+            / max(rados_obj_size, 1))
+        total_objects = objects_per_osd * recovery_osds
+
+        # Recovery ops across all surviving OSDs
+        cluster_recovery_ops = recovery_ops_per_sec * surviving_osds
+        if cluster_recovery_ops > 0:
+            recovery_time_sec = total_objects / cluster_recovery_ops
+            recovery_time_hours = recovery_time_sec / 3600
+        else:
+            recovery_time_hours = float('inf')
+
+        return {
+            'failed_osds': recovery_osds,
+            'surviving_osds': surviving_osds,
+            'recovery_cpu_per_obj_us': recovery_cpu_per_obj,
+            'recovery_ops_per_osd_sec': effective_recovery_ops,
+            'normal_cpu_per_osd_us': normal_cpu_per_osd,
+            'recovery_cpu_per_osd_us': recovery_cpu_per_osd,
+            'total_cpu_per_osd_us': total_cpu_per_osd,
+            'max_osds_during_recovery': math.floor(max_osds_recovery),
+            'client_io_fraction': client_iops_fraction,
+            'client_iops_degraded': int(drive_iops * client_iops_fraction),
+            'est_recovery_time_hours': recovery_time_hours,
         }
 
     def _compute_per_io_cpu_cost(self):
@@ -1125,6 +1358,8 @@ class ReportGenerator:
         self._print_cpu_cost_breakdown()
         self._print_capacity_estimate()
         self._print_scale_out_table()
+        if 'recovery' in self.capacity:
+            self._print_recovery_analysis()
         self._print_recommendations()
 
     def _print_header(self):
@@ -1171,6 +1406,9 @@ class ReportGenerator:
               f"({rw*100:.0f}% read / {(1-rw)*100:.0f}% write)")
         print(f"Scrub:        {self.config.scrub_frequency.capitalize()}")
         print(f"Scenario:     {self.config.scenario.capitalize()}")
+        if self.config.recovery_osds > 0:
+            print(f"Recovery:     Simulating {self.config.recovery_osds} "
+                  f"OSD failure(s)")
 
     def _print_benchmark_results(self):
         print()
@@ -1261,6 +1499,80 @@ class ReportGenerator:
             print(f"{row['nodes']:>5} {row['osds_per_node']:>10} "
                   f"{row['total_osds']:>11} {row['raw_iops']:>14,} "
                   f"{row['effective_iops']:>14,} {tp:>14} {cpu_ltd:>8}")
+
+    def _print_recovery_analysis(self):
+        rec = self.capacity.get('recovery', {})
+        if not rec:
+            return
+
+        print()
+        print("=" * 60)
+        print("  Recovery Impact Analysis")
+        print("=" * 60)
+        print(f"Failed OSDs:           {rec['failed_osds']}")
+        print(f"Surviving OSDs:        {rec['surviving_osds']}")
+        print()
+
+        print("--- Per-Object Recovery Cost ---")
+        print(f"Recovery CPU/object:   {rec['recovery_cpu_per_obj_us']:,.2f} us")
+        normal_io_cost = self.capacity['cpu_us_per_io']
+        multiplier = (rec['recovery_cpu_per_obj_us'] / normal_io_cost
+                      if normal_io_cost > 0 else 0)
+        print(f"Normal IO CPU/op:      {normal_io_cost:,.2f} us")
+        print(f"Recovery cost:         {multiplier:.1f}x normal IO")
+        print()
+
+        print("--- Per-OSD CPU Budget During Recovery ---")
+        print(f"Normal client IO:      "
+              f"{rec['normal_cpu_per_osd_us']:,.0f} us/sec")
+        print(f"Recovery overhead:     "
+              f"{rec['recovery_cpu_per_osd_us']:,.0f} us/sec "
+              f"({rec['recovery_ops_per_osd_sec']:.0f} recovery ops/sec)")
+        print(f"Combined load:         "
+              f"{rec['total_cpu_per_osd_us']:,.0f} us/sec")
+        print()
+
+        print("--- Cluster Impact ---")
+        max_normal = self.capacity['max_osds_adjusted']
+        max_recovery = rec['max_osds_during_recovery']
+        print(f"Max OSDs (normal):     {max_normal}")
+        print(f"Max OSDs (recovery):   {max_recovery}")
+        if max_normal > 0:
+            reduction = ((max_normal - max_recovery) / max_normal * 100)
+            print(f"Capacity reduction:    {reduction:.0f}%")
+
+        client_pct = rec['client_io_fraction'] * 100
+        print(f"Client IO capacity:    {client_pct:.0f}% of normal")
+        print(f"Client IOPS/OSD:       {rec['client_iops_degraded']:,} "
+              f"(was {self.capacity['drive_iops']:,})")
+        hours = rec['est_recovery_time_hours']
+        if hours < 1.0:
+            print(f"Est. recovery time:    {hours * 60:.0f} minutes")
+        else:
+            print(f"Est. recovery time:    {hours:.1f} hours")
+
+        if max_recovery < max_normal:
+            print()
+            if max_recovery < self.config.drive_count - rec['failed_osds']:
+                print("!! CRITICAL: Recovery overhead pushes CPU beyond "
+                      "capacity.")
+                print("   CPU cannot sustain the surviving OSDs during "
+                      "recovery.")
+                print("   This can cause cascading slowdowns and "
+                      "client timeouts.")
+            else:
+                print("!! WARNING: Recovery reduces max supportable OSDs "
+                      f"from {max_normal} to {max_recovery}.")
+
+        if rec['client_io_fraction'] < 0.5:
+            print()
+            print("!! WARNING: Client IO drops below 50% during recovery.")
+            print("   Applications will experience significant latency "
+                  "increases.")
+        elif rec['client_io_fraction'] < 0.8:
+            print()
+            print("!! CAUTION: Client IO reduced to "
+                  f"{client_pct:.0f}% during recovery.")
 
     def _print_recommendations(self):
         cap = self.capacity
@@ -1392,6 +1704,8 @@ class ReportGenerator:
             },
             'scale_out': self.scale_out,
         }
+        if 'recovery' in self.capacity:
+            data['recovery'] = self.capacity['recovery']
         return json.dumps(data, indent=2)
 
 
@@ -1717,6 +2031,11 @@ Examples:
                         choices=['best', 'worst', 'typical', 'all'],
                         help='Scenario (default: typical)')
 
+    rec = parser.add_argument_group('Recovery Simulation')
+    rec.add_argument('--recovery-osds', type=int, default=0,
+                     help='Simulate N OSD failures to model recovery '
+                          'CPU impact (default: 0 = no recovery sim)')
+
     out = parser.add_argument_group('Output')
     out.add_argument('--output', '-o', default=None,
                      help='CSV output file')
@@ -1780,6 +2099,7 @@ def build_config_from_args(args) -> ClusterConfig:
         config.compression_mode = args.compress_mode
 
     config.wal_db_separate = args.wal_db_separate
+    config.recovery_osds = args.recovery_osds
     config.object_size = args.object_size
     config.workload_pattern = args.workload
     config.read_write_ratio = args.rw_ratio
