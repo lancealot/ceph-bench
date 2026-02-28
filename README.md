@@ -82,3 +82,65 @@ OSD.186: Avg IOPS: 1548.19, Avg Throughput: 48.38 MB/s
 OSD.214: Avg IOPS: 1560.95, Avg Throughput: 48.78 MB/s
 ....
 ```
+
+### ceph-cpu-io-sim.py - CPU Capacity Simulator
+
+Benchmarks the local CPU's ability to perform Ceph OSD operations (checksumming,
+compression, erasure coding, serialization, metadata ops) and estimates how many
+OSDs the CPU can sustain at various drive speeds. Useful for capacity planning
+before deploying hardware.
+
+No Ceph cluster or optional dependencies are required (runs with Python3 stdlib
+only), but accuracy improves when Ceph libraries (pyeclib, lz4, zstd, etc.)
+are available. Libraries are auto-detected with a three-tier fallback strategy.
+
+CPU Simulator options:
+```
+  --interactive, -i     Interactive guided configuration
+  --quick               Quick benchmark with sensible defaults
+  --drive-type, -t      Drive type: hdd|ssd|nvme (default: hdd)
+  --drive-count, -d     Drives per node (default: 12)
+  --drive-iops          Override drive IOPS (0=use profile default)
+  --protection, -p      Protection: replicated:N or ec:K+M (default: replicated:3)
+  --compress, -c        Enable compression: snappy|zstd|lz4|zlib
+  --compress-ratio      Expected compression ratio (default: 0.5)
+  --compress-mode       Compression mode: passive|aggressive|force (default: passive)
+  --wal-db-separate     WAL/DB on separate fast device
+  --object-size         RADOS object size (default: 4m)
+  --workload            Workload pattern: sequential|random|mixed (default: mixed)
+  --rw-ratio            Read/write ratio 0.0-1.0 (default: 0.7)
+  --scrub               Scrub frequency: daily|weekly|disabled (default: daily)
+  --scenario, -s        Scenario: best|worst|typical|all (default: typical)
+  --output, -o          CSV output file
+  --compare             Compare with ceph-bench.sh CSV results
+  --json                Output results as JSON
+  --duration            Seconds per benchmark (default: 5.0)
+  --sizes               Object sizes to test (default: 4k 64k 128k 4m)
+  --cpu-cores           Total CPU cores (0=auto-detect)
+  --cpu-cores-ceph      CPU cores reserved for Ceph (0=auto)
+  --verbose, -v         Verbose output
+```
+
+Example usage:
+```
+# Quick benchmark with defaults
+./ceph-cpu-io-sim.py --quick
+
+# HDD cluster with 12 drives, 3x replication
+./ceph-cpu-io-sim.py --drive-type hdd --drive-count 12 --protection replicated:3
+
+# NVMe cluster with EC and compression
+./ceph-cpu-io-sim.py --drive-type nvme --drive-count 4 --protection ec:4+2 --compress zstd
+
+# Compare simulation with real benchmark results
+./ceph-cpu-io-sim.py --drive-type hdd --compare ceph_bench_results.csv
+
+# Run all scenarios for capacity planning
+./ceph-cpu-io-sim.py --drive-type ssd --drive-count 8 --scenario all
+```
+
+Dependencies:
+  - Python 3.6+
+  - No required external packages (all benchmarks have stdlib fallbacks)
+  - Optional: pyeclib, lz4, pyzstd/zstandard, python-snappy, crcmod,
+    python-rocksdb (for higher accuracy benchmarks)
