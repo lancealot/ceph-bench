@@ -101,6 +101,8 @@ CPU Simulator options:
   --drive-type, -t      Drive type: hdd|ssd|nvme (default: hdd)
   --drive-count, -d     Drives per node (default: 12)
   --drive-iops          Override drive IOPS (0=use profile: HDD=150, SSD=50K, NVMe=500K)
+  --drives NxTYPE [..]  Mixed media: e.g. --drives 36xhdd 4xnvme
+                         Format: COUNTxTYPE[:IOPS] (overrides --drive-type/count)
   --protection, -p      Protection: replicated:N or ec:K+M (default: replicated:3)
   --compress, -c        Enable compression: snappy|zstd|lz4|zlib
   --compress-ratio      Expected compression ratio 0.0-1.0 (default: 0.5)
@@ -111,10 +113,10 @@ CPU Simulator options:
   --rw-ratio            Read/write ratio: 0.0=all writes, 1.0=all reads (default: 0.7)
   --scrub               Scrub frequency: daily|weekly|disabled (default: daily)
   --scenario, -s        Scenario: best|worst|typical|all (default: typical)
-  --recovery-osds       Simulate N OSD failures for recovery CPU analysis (default: 0)
+  --recovery-osds       Simulate N OSD failures for recovery CPU analysis
   --output, -o          CSV output base file (creates *_benchmarks.csv and *_capacity.csv)
   --compare             Compare with ceph-bench.sh CSV results
-  --json                Output results as JSON (valid JSON, compatible with --scenario all)
+  --json                Output results as JSON (valid JSON, supports --scenario all)
   --duration            Seconds per benchmark operation (default: 5.0)
   --sizes               Object sizes for micro-benchmarks (default: 4k 64k 128k 4m)
   --cpu-cores           Total CPU cores (0=auto-detect)
@@ -132,6 +134,12 @@ Example usage:
 
 # NVMe cluster with EC and compression
 ./ceph-cpu-io-sim.py --drive-type nvme --drive-count 4 --protection ec:4+2 --compress zstd
+
+# Mixed media: 36 HDDs for data + 4 NVMe for CephFS metadata
+./ceph-cpu-io-sim.py --drives 36xhdd 4xnvme --wal-db-separate
+
+# Mixed media with IOPS overrides
+./ceph-cpu-io-sim.py --drives 36xhdd:150 4xnvme:10000 --recovery-osds 1
 
 # Compare simulation with real benchmark results
 ./ceph-cpu-io-sim.py --drive-type hdd --compare ceph_bench_results.csv
