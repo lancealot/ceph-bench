@@ -549,6 +549,24 @@ class BenchmarkResult:
 
 
 @dataclass
+class DeviceClass:
+    """Represents one class of drives in a mixed-media configuration."""
+    drive_type: str = 'hdd'
+    count: int = 12
+    iops_override: int = 0
+
+    def get_iops(self, scenario: str = 'typical') -> int:
+        if self.iops_override > 0:
+            return self.iops_override
+        profile = DRIVE_PROFILES[self.drive_type]
+        if scenario == 'best':
+            return profile['random_iops_min']
+        elif scenario == 'worst':
+            return profile['random_iops_max']
+        return profile['random_iops_typical']
+
+
+@dataclass
 class ClusterConfig:
     """Represents the user's theoretical cluster configuration."""
     cpu_cores: int = 0
@@ -559,6 +577,10 @@ class ClusterConfig:
     drive_count: int = 12
     drive_iops: int = 0
     drive_throughput_mb: int = 0
+
+    # Mixed-media support: list of device classes.
+    # When populated, overrides drive_type / drive_count / drive_iops.
+    device_classes: List['DeviceClass'] = field(default_factory=list)
 
     protection_type: str = 'replicated'
     replica_count: int = 3
@@ -604,6 +626,26 @@ class ClusterConfig:
         if self.drive_throughput_mb > 0:
             return self.drive_throughput_mb
         return DRIVE_PROFILES[self.drive_type]['seq_throughput_mb']
+
+    @property
+    def is_mixed_media(self) -> bool:
+        return len(self.device_classes) > 1
+
+    def get_effective_device_classes(self) -> List['DeviceClass']:
+        """Return device classes (mixed-media or single-class fallback)."""
+        if self.device_classes:
+            return self.device_classes
+        return [DeviceClass(
+            drive_type=self.drive_type,
+            count=self.drive_count,
+            iops_override=self.drive_iops,
+        )]
+
+    @property
+    def total_drive_count(self) -> int:
+        if self.device_classes:
+            return sum(dc.count for dc in self.device_classes)
+        return self.drive_count
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +706,7 @@ class CephBenchmarks:
             recovery_obj_size = 4194304  # 4M RADOS default
             recovery_data = os.urandom(recovery_obj_size)
             self._print_progress(
-                f"  Recovery (full pipeline) @ {self.config.object_size}...")
+                f"  Recovery (full pipeline) @ 4m (RADOS object size)...")
             if self.config.protection_type == 'erasure':
                 self._bench_recovery_ec(recovery_data)
             else:
@@ -1000,32 +1042,115 @@ class OSDCapacityModel:
 
         total_cpu_us_per_io = self._total_cpu_cost_per_io()
         available_cpu_us = self.config.cpu_cores_for_ceph * 1_000_000
-        drive_iops = self.config.get_drive_iops()
 
         if total_cpu_us_per_io <= 0:
             total_cpu_us_per_io = 1.0
 
-        cpu_us_per_osd_per_sec = total_cpu_us_per_io * drive_iops
+        overhead = self._compute_overhead_multiplier()
 
+        # ---- Mixed-media per-class analysis ----
+        device_classes = self.config.get_effective_device_classes()
+        per_class = []
+        total_cpu_used_us = 0.0
+
+        for dc in device_classes:
+            dc_iops = dc.get_iops(self.config.scenario)
+            cpu_per_osd_sec = total_cpu_us_per_io * dc_iops
+            cpu_total_class = dc.count * cpu_per_osd_sec * overhead
+
+            if cpu_per_osd_sec > 0:
+                max_osds_raw = available_cpu_us / (cpu_per_osd_sec * overhead)
+            else:
+                max_osds_raw = float('inf')
+
+            max_osds_adj = (min(math.floor(max_osds_raw), dc.count)
+                            if not math.isinf(max_osds_raw)
+                            else dc.count)
+
+            entry = {
+                'drive_type': dc.drive_type,
+                'drive_count': dc.count,
+                'drive_iops': dc_iops,
+                'cpu_us_per_osd_per_sec': cpu_per_osd_sec,
+                'cpu_total_us_sec': cpu_total_class,
+                'max_osds_standalone': max_osds_adj,
+                'latency_ms': DRIVE_PROFILES[dc.drive_type]['latency_ms'],
+            }
+            per_class.append(entry)
+            total_cpu_used_us += cpu_total_class
+
+        # How many OSDs of each class can share the CPU simultaneously?
+        #
+        # Strategy: fulfill cheaper classes first (HDDs use much less CPU
+        # per OSD than NVMe), then allocate remaining CPU to expensive
+        # classes. This reflects how real clusters work -- you wouldn't
+        # run NVMe OSDs at full random-IOPS on a node with 36 HDDs.
+        #
+        # Sort by CPU cost per OSD (ascending) so cheap classes get
+        # their full allocation first.
+        sorted_classes = sorted(
+            enumerate(per_class), key=lambda x: x[1]['cpu_us_per_osd_per_sec'])
+
+        remaining_cpu = available_cpu_us
+        for idx, entry in sorted_classes:
+            cpu_per_osd = entry['cpu_us_per_osd_per_sec'] * overhead
+            if cpu_per_osd > 0:
+                max_from_budget = remaining_cpu / cpu_per_osd
+                osds = min(entry['drive_count'], math.floor(max_from_budget))
+                osds = max(0, osds)
+            else:
+                osds = entry['drive_count']
+            entry['max_osds_shared'] = osds
+            entry['cpu_limited'] = osds < entry['drive_count']
+            remaining_cpu -= osds * cpu_per_osd * (1 if cpu_per_osd > 0 else 0)
+
+        total_shared_osds = sum(e['max_osds_shared'] for e in per_class)
+        total_drives = sum(e['drive_count'] for e in per_class)
+
+        # For single-class backward compat, also compute simple numbers
+        drive_iops = self.config.get_drive_iops()
+        cpu_us_per_osd_per_sec = total_cpu_us_per_io * drive_iops
         if cpu_us_per_osd_per_sec > 0:
             max_osds = available_cpu_us / cpu_us_per_osd_per_sec
         else:
             max_osds = float('inf')
-
-        overhead = self._compute_overhead_multiplier()
         max_osds_adjusted = max_osds / overhead
+        if math.isinf(max_osds_adjusted):
+            max_osds_adjusted_int = 999999
+        else:
+            max_osds_adjusted_int = math.floor(max_osds_adjusted)
+
+        headroom = self._compute_headroom(max_osds_adjusted)
+        if self.config.is_mixed_media:
+            # Headroom based on combined usage
+            if total_cpu_used_us > 0:
+                headroom = ((available_cpu_us - total_cpu_used_us)
+                            / available_cpu_us * 100)
+            else:
+                headroom = 100.0
+
+        # Guard against inf from zero IOPS edge case
+        if math.isinf(max_osds_adjusted):
+            max_osds_adjusted_int = 999999
+        else:
+            max_osds_adjusted_int = math.floor(max_osds_adjusted)
 
         result = {
             'max_osds_raw': max_osds,
-            'max_osds_adjusted': math.floor(max_osds_adjusted),
+            'max_osds_adjusted': max_osds_adjusted_int,
             'cpu_us_per_io': total_cpu_us_per_io,
             'cpu_us_per_osd_per_sec': cpu_us_per_osd_per_sec,
             'overhead_multiplier': overhead,
             'drive_iops': drive_iops,
             'available_cpu_us': available_cpu_us,
             'per_operation_costs': dict(self._cpu_costs),
-            'headroom_percentage': self._compute_headroom(max_osds_adjusted),
+            'headroom_percentage': headroom,
         }
+
+        if self.config.is_mixed_media:
+            result['per_device_class'] = per_class
+            result['total_shared_osds'] = total_shared_osds
+            result['total_drives'] = total_drives
 
         if self.config.recovery_osds > 0:
             result['recovery'] = self._compute_recovery_impact(
@@ -1078,8 +1203,14 @@ class OSDCapacityModel:
             # must help recover
             recovery_participation = (recovery_osds / surviving_osds)
         else:
-            # EC: need k chunks to reconstruct, all survivors participate
-            recovery_participation = (recovery_osds / surviving_osds)
+            # EC: recovery requires reading k chunks from surviving OSDs
+            # and writing m new parity/data chunks.  The load is spread
+            # across survivors but each operation touches k+m OSDs.
+            ec_width = self.config.ec_k + self.config.ec_m
+            participation_ratio = min(ec_width / surviving_osds, 1.0)
+            recovery_participation = (
+                (recovery_osds / surviving_osds) * participation_ratio
+                * (ec_width / max(self.config.ec_k, 1)))
 
         # Recovery IOPS per surviving OSD (Ceph rate-limits recovery,
         # but default osd_recovery_max_active=3 and
@@ -1324,6 +1455,12 @@ class OSDCapacityModel:
             algo = self.config.compression_algorithm
             compress_c = self._get_cost(f'compress_{algo}')
             decompress_c = self._get_cost(f'decompress_{algo}')
+            # If the configured algorithm wasn't available and we fell back
+            # to a different one, find whatever compression benchmark ran
+            if compress_c == 0.0:
+                compress_c = self._get_cost('compress_')
+            if decompress_c == 0.0:
+                decompress_c = self._get_cost('decompress_')
             comp_cost = ((1 - rw) * p * compress_c +
                          rw * p * decompress_c)
 
@@ -1425,18 +1562,33 @@ class ScaleOutProjection:
         return rows
 
     def _project_for_nodes(self, node_count: int) -> Dict[str, Any]:
-        osds_per_node = min(self.config.drive_count,
-                            max(self.capacity['max_osds_adjusted'], 0))
-        total_osds = osds_per_node * node_count
-        drive_iops = self.config.get_drive_iops()
-
-        total_iops = total_osds * drive_iops
+        # Mixed-media: aggregate across device classes
+        per_class_data = self.capacity.get('per_device_class')
+        if per_class_data:
+            total_osds = 0
+            total_iops = 0
+            any_limited = False
+            for entry in per_class_data:
+                osds = entry['max_osds_shared']
+                total_osds += osds * node_count
+                total_iops += osds * node_count * entry['drive_iops']
+                if entry['cpu_limited']:
+                    any_limited = True
+            osds_per_node = sum(e['max_osds_shared'] for e in per_class_data)
+        else:
+            osds_per_node = min(self.config.drive_count,
+                                max(self.capacity['max_osds_adjusted'], 0))
+            total_osds = osds_per_node * node_count
+            drive_iops = self.config.get_drive_iops()
+            total_iops = total_osds * drive_iops
+            any_limited = (self.config.drive_count >
+                           self.capacity['max_osds_adjusted'])
 
         if self.config.protection_type == 'replicated':
             write_amplification = self.config.replica_count
         else:
             write_amplification = ((self.config.ec_k + self.config.ec_m) /
-                                   self.config.ec_k)
+                                   max(self.config.ec_k, 1))
 
         rw = self.config.read_write_ratio
         denominator = rw * 1.0 + (1 - rw) * write_amplification
@@ -1462,8 +1614,7 @@ class ScaleOutProjection:
             'effective_iops': int(effective_iops),
             'throughput_mbps': throughput_mbps,
             'network_efficiency': network_efficiency,
-            'cpu_limited': (self.config.drive_count >
-                            self.capacity['max_osds_adjusted']),
+            'cpu_limited': any_limited,
         }
 
 
@@ -1530,10 +1681,18 @@ class ReportGenerator:
 
     def _print_config_summary(self):
         print("=== Cluster Configuration ===")
-        print(f"Drive Type:   {self.config.drive_type.upper()}")
-        print(f"Drive Count:  {self.config.drive_count} per node")
-        print(f"Drive IOPS:   {self.config.get_drive_iops():,} "
-              f"({self.config.scenario} profile)")
+        if self.config.is_mixed_media:
+            print("Drive Config: Mixed media")
+            for dc in self.config.device_classes:
+                iops = dc.get_iops(self.config.scenario)
+                print(f"  {dc.count}x {dc.drive_type.upper():>4} @ "
+                      f"{iops:>10,} IOPS ({self.config.scenario})")
+            print(f"Total Drives: {self.config.total_drive_count} per node")
+        else:
+            print(f"Drive Type:   {self.config.drive_type.upper()}")
+            print(f"Drive Count:  {self.config.drive_count} per node")
+            print(f"Drive IOPS:   {self.config.get_drive_iops():,} "
+                  f"({self.config.scenario} profile)")
 
         if self.config.protection_type == 'replicated':
             print(f"Protection:   Replicated x{self.config.replica_count}")
@@ -1607,30 +1766,106 @@ class ReportGenerator:
         print(f"Available CPU:         "
               f"{cap['available_cpu_us']:,.0f} us/sec "
               f"({self.config.cpu_cores_for_ceph:.0f} cores)")
-        print(f"Drive IOPS:            "
-              f"{cap['drive_iops']:,} "
-              f"({self.config.drive_type.upper()} {self.config.scenario})")
-        print(f"CPU per IO:            {cap['cpu_us_per_io']:,.2f} us")
-        print(f"CPU per OSD per sec:   {cap['cpu_us_per_osd_per_sec']:,.0f} us")
-        print(f"Overhead multiplier:   {cap['overhead_multiplier']:.2f}x")
-        print(f"Max OSDs (raw):        {cap['max_osds_raw']:.2f}")
-        print(f"Max OSDs (adjusted):   {cap['max_osds_adjusted']}")
-        print(f"Drives configured:     {self.config.drive_count}")
+
+        if self.config.is_mixed_media:
+            self._print_mixed_media_capacity()
+        else:
+            print(f"Drive IOPS:            "
+                  f"{cap['drive_iops']:,} "
+                  f"({self.config.drive_type.upper()} "
+                  f"{self.config.scenario})")
+            print(f"CPU per IO:            "
+                  f"{cap['cpu_us_per_io']:,.2f} us")
+            print(f"CPU per OSD per sec:   "
+                  f"{cap['cpu_us_per_osd_per_sec']:,.0f} us")
+            print(f"Overhead multiplier:   "
+                  f"{cap['overhead_multiplier']:.2f}x")
+            print(f"Max OSDs (raw):        "
+                  f"{cap['max_osds_raw']:.2f}")
+            print(f"Max OSDs (adjusted):   "
+                  f"{cap['max_osds_adjusted']}")
+            print(f"Drives configured:     "
+                  f"{self.config.drive_count}")
+
+            headroom = cap['headroom_percentage']
+            if headroom > 0:
+                print(f"CPU headroom:          {headroom:.1f}%")
+            else:
+                over = ((self.config.drive_count /
+                         max(cap['max_osds_adjusted'], 0.01) - 1) * 100)
+                print(f"CPU headroom:          NEGATIVE "
+                      f"({over:.0f}% overprovisioned)")
+
+            if cap['max_osds_adjusted'] < self.config.drive_count:
+                print()
+                print("!! WARNING: CPU cannot sustain all configured "
+                      "drives at expected IOPS.")
+                print("   Drives will be throttled by CPU capacity.")
+
+    def _print_mixed_media_capacity(self):
+        cap = self.capacity
+        per_class = cap.get('per_device_class', [])
+        overhead = cap['overhead_multiplier']
+
+        print(f"CPU per IO:            "
+              f"{cap['cpu_us_per_io']:,.2f} us "
+              f"(same for all device classes)")
+        print(f"Overhead multiplier:   {overhead:.2f}x")
+        print()
+
+        header = (f"{'Type':>6} {'Count':>6} {'IOPS/drv':>10} "
+                  f"{'CPU/OSD/s':>12} {'Alone':>6} {'Shared':>7} "
+                  f"{'CPU Ltd':>8}")
+        print(header)
+        print("-" * len(header))
+        for entry in per_class:
+            dtype = entry['drive_type'].upper()
+            count = entry['drive_count']
+            iops = entry['drive_iops']
+            cpu_sec = entry['cpu_us_per_osd_per_sec']
+            alone = entry['max_osds_standalone']
+            shared = entry['max_osds_shared']
+            limited = 'YES' if entry['cpu_limited'] else ''
+            print(f"{dtype:>6} {count:>6} {iops:>10,} "
+                  f"{cpu_sec:>12,.0f} {alone:>6} {shared:>7} "
+                  f"{limited:>8}")
+
+        total_drives = cap.get('total_drives', 0)
+        total_shared = cap.get('total_shared_osds', 0)
+        print("-" * len(header))
+        print(f"{'TOTAL':>6} {total_drives:>6} {'':>10} {'':>12} "
+              f"{'':>6} {total_shared:>7}")
 
         headroom = cap['headroom_percentage']
+        print()
         if headroom > 0:
             print(f"CPU headroom:          {headroom:.1f}%")
         else:
-            over = ((self.config.drive_count /
-                     max(cap['max_osds_adjusted'], 0.01) - 1) * 100)
             print(f"CPU headroom:          NEGATIVE "
-                  f"({over:.0f}% overprovisioned)")
+                  f"({-headroom:.0f}% overprovisioned)")
 
-        if cap['max_osds_adjusted'] < self.config.drive_count:
+        # Identify which class is the biggest CPU consumer
+        if per_class:
+            heaviest = max(per_class, key=lambda e: e['cpu_total_us_sec'])
+            total_cpu = sum(e['cpu_total_us_sec'] for e in per_class)
+            if total_cpu > 0:
+                pct = heaviest['cpu_total_us_sec'] / total_cpu * 100
+                print(f"\nDominant consumer: "
+                      f"{heaviest['drive_count']}x "
+                      f"{heaviest['drive_type'].upper()} "
+                      f"({pct:.0f}% of total CPU demand)")
+
+        # Warning if any class is throttled
+        any_limited = any(e['cpu_limited'] for e in per_class)
+        if any_limited:
             print()
-            print("!! WARNING: CPU cannot sustain all configured drives "
-                  "at expected IOPS.")
-            print("   Drives will be throttled by CPU capacity.")
+            print("!! WARNING: CPU cannot sustain all drives at "
+                  "expected IOPS.")
+            for entry in per_class:
+                if entry['cpu_limited']:
+                    print(f"   {entry['drive_type'].upper()}: "
+                          f"{entry['max_osds_shared']} of "
+                          f"{entry['drive_count']} drives active")
 
     def _print_scale_out_table(self):
         print()
@@ -1877,8 +2112,11 @@ class ReportGenerator:
             print("  - Using larger RADOS object sizes")
 
     def export_csv(self, filepath: str):
-        bench_path = filepath.replace('.csv', '_benchmarks.csv')
-        cap_path = filepath.replace('.csv', '_capacity.csv')
+        base, ext = os.path.splitext(filepath)
+        if not ext:
+            ext = '.csv'
+        bench_path = f"{base}_benchmarks{ext}"
+        cap_path = f"{base}_capacity{ext}"
 
         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -1918,6 +2156,16 @@ class ReportGenerator:
                 f"{cap['headroom_percentage']:.1f}"])
         print(f"Capacity estimates saved to: {cap_path}")
 
+    @staticmethod
+    def _json_safe(obj):
+        """Replace inf/nan with JSON-safe values."""
+        if isinstance(obj, float):
+            if math.isinf(obj):
+                return None
+            if math.isnan(obj):
+                return None
+        return obj
+
     def to_json(self) -> str:
         data = {
             'version': VERSION,
@@ -1928,6 +2176,7 @@ class ReportGenerator:
                 'cpu_cores_for_ceph': self.config.cpu_cores_for_ceph,
                 'architecture': platform.machine(),
                 'python_version': platform.python_version(),
+                'os': f'{platform.system()} {platform.release()}',
             },
             'config': {
                 'drive_type': self.config.drive_type,
@@ -1939,8 +2188,23 @@ class ReportGenerator:
                 'ec_m': self.config.ec_m,
                 'compression_enabled': self.config.compression_enabled,
                 'compression_algorithm': self.config.compression_algorithm,
+                'compression_mode': self.config.compression_mode,
+                'compression_ratio': self.config.compression_ratio,
                 'object_size': self.config.object_size,
                 'scenario': self.config.scenario,
+                'workload_pattern': self.config.workload_pattern,
+                'read_write_ratio': self.config.read_write_ratio,
+                'scrub_frequency': self.config.scrub_frequency,
+                'wal_db_separate': self.config.wal_db_separate,
+            },
+            'libraries': {
+                'crc32c': self.libs.available.get('crc32c', 'N/A'),
+                'lz4': self.libs.available.get('lz4', 'N/A'),
+                'zstd': self.libs.available.get('zstd', 'N/A'),
+                'snappy': self.libs.available.get('snappy', 'N/A'),
+                'erasure_coding': self.libs.available.get(
+                    'erasure_coding', 'N/A'),
+                'rocksdb': self.libs.available.get('rocksdb', 'N/A'),
             },
             'benchmarks': [
                 {
@@ -1949,7 +2213,11 @@ class ReportGenerator:
                     'ops_per_sec': round(r.ops_per_sec, 2),
                     'cpu_time_per_op_us': round(r.cpu_time_per_op_us, 2),
                     'throughput_mbps': round(r.throughput_mbps, 2),
+                    'cpu_utilization': round(r.cpu_utilization, 4),
+                    'iterations': r.iterations,
+                    'elapsed_sec': round(r.elapsed_sec, 3),
                     'library_used': r.library_used,
+                    'notes': r.notes,
                 }
                 for r in self.bench_results
             ],
@@ -1957,18 +2225,53 @@ class ReportGenerator:
                 'max_osds_raw': round(self.capacity['max_osds_raw'], 2),
                 'max_osds_adjusted': self.capacity['max_osds_adjusted'],
                 'cpu_us_per_io': round(self.capacity['cpu_us_per_io'], 2),
+                'cpu_us_per_osd_per_sec': round(
+                    self.capacity['cpu_us_per_osd_per_sec'], 2),
+                'available_cpu_us': self.capacity['available_cpu_us'],
+                'drive_iops': self.capacity['drive_iops'],
                 'overhead_multiplier': round(
                     self.capacity['overhead_multiplier'], 2),
                 'headroom_percentage': round(
                     self.capacity['headroom_percentage'], 1),
+                'per_operation_costs': {
+                    k: round(v, 2)
+                    for k, v in self.capacity.get(
+                        'per_operation_costs', {}).items()
+                },
             },
             'scale_out': self.scale_out,
         }
+        if self.config.is_mixed_media:
+            data['config']['device_classes'] = [
+                {
+                    'drive_type': dc.drive_type,
+                    'count': dc.count,
+                    'iops': dc.get_iops(self.config.scenario),
+                }
+                for dc in self.config.device_classes
+            ]
+        if 'per_device_class' in self.capacity:
+            data['capacity']['per_device_class'] = (
+                self.capacity['per_device_class'])
+            data['capacity']['total_shared_osds'] = (
+                self.capacity.get('total_shared_osds', 0))
         if 'recovery' in self.capacity:
             data['recovery'] = self.capacity['recovery']
         if 'cpu_scaling' in self.capacity:
             data['cpu_scaling'] = self.capacity['cpu_scaling']
-        return json.dumps(data, indent=2)
+
+        # Replace inf/nan with null for valid JSON
+        def sanitize(obj):
+            if isinstance(obj, dict):
+                return {k: sanitize(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [sanitize(v) for v in obj]
+            if isinstance(obj, float):
+                if math.isinf(obj) or math.isnan(obj):
+                    return None
+            return obj
+
+        return json.dumps(sanitize(data), indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -2031,13 +2334,14 @@ def compare_with_real(csv_path: str, config: ClusterConfig,
 
         cpu_us_per_io = capacity['cpu_us_per_io']
         available_cpu_us = capacity['available_cpu_us']
+        overhead = capacity.get('overhead_multiplier', 1.0)
 
         for dc, data in sorted(device_classes.items()):
             if not data['iops']:
                 continue
             avg_iops = sum(data['iops']) / len(data['iops'])
             osd_count = len(data['osds'])
-            real_cpu_per_osd = cpu_us_per_io * avg_iops
+            real_cpu_per_osd = cpu_us_per_io * avg_iops * overhead
             if real_cpu_per_osd > 0:
                 real_max_osds = available_cpu_us / real_cpu_per_osd
             else:
@@ -2230,6 +2534,8 @@ def parse_args():
 Examples:
   %(prog)s --drive-type hdd --drive-count 12 --protection replicated:3
   %(prog)s --drive-type nvme --drive-count 4 --protection ec:4+2 --compress zstd
+  %(prog)s --drives 36xhdd 4xnvme --wal-db-separate --recovery-osds 1
+  %(prog)s --drives 36xhdd:150 4xnvme:100000     # with IOPS overrides
   %(prog)s --interactive
   %(prog)s --quick
   %(prog)s --compare real_bench_results.csv
@@ -2239,7 +2545,8 @@ Examples:
     mode.add_argument('--interactive', '-i', action='store_true',
                       help='Interactive guided configuration')
     mode.add_argument('--quick', action='store_true',
-                      help='Quick benchmark with sensible defaults')
+                      help='Quick benchmark (2s duration, fewer sizes). '
+                           'Other CLI flags are still honored')
 
     cpu = parser.add_argument_group('CPU Configuration')
     cpu.add_argument('--cpu-cores', type=int, default=0,
@@ -2251,15 +2558,26 @@ Examples:
     drive = parser.add_argument_group('Drive Configuration')
     drive.add_argument('--drive-type', '-t',
                        choices=['hdd', 'ssd', 'nvme'], default='hdd',
-                       help='Drive type (default: hdd)')
+                       help='Drive type for single-class config '
+                            '(default: hdd). Use --drives for mixed media')
     drive.add_argument('--drive-count', '-d', type=int, default=12,
-                       help='Drives per node (default: 12)')
+                       help='Drives per node for single-class config '
+                            '(default: 12). Use --drives for mixed media')
     drive.add_argument('--drive-iops', type=int, default=0,
-                       help='Override drive IOPS (0=use profile default)')
+                       help='Override drive IOPS (0=use profile: '
+                            'HDD=150, SSD=50K, NVMe=500K typical)')
+    drive.add_argument('--drives', nargs='+', default=None,
+                       metavar='NxTYPE',
+                       help='Mixed media: specify multiple device classes. '
+                            'Format: COUNTxTYPE[:IOPS]. '
+                            'Example: --drives 36xhdd 4xnvme '
+                            'or --drives 36xhdd:150 4xnvme:100000. '
+                            'Overrides --drive-type/--drive-count')
 
     prot = parser.add_argument_group('Data Protection')
     prot.add_argument('--protection', '-p', default='replicated:3',
-                      help='Protection: replicated:N or ec:K+M '
+                      help='Protection: replicated:N (N=replica count) or '
+                           'ec:K+M (K=data, M=parity chunks) '
                            '(default: replicated:3)')
 
     comp = parser.add_argument_group('Compression')
@@ -2267,10 +2585,13 @@ Examples:
                       choices=['snappy', 'zstd', 'lz4', 'zlib'],
                       help='Enable compression with specified algorithm')
     comp.add_argument('--compress-ratio', type=float, default=0.5,
-                      help='Expected compression ratio (default: 0.5)')
+                      help='Expected compression ratio: 0.5 means data '
+                           'compresses to 50%% of original (default: 0.5)')
     comp.add_argument('--compress-mode', default='passive',
                       choices=['passive', 'aggressive', 'force'],
-                      help='Compression mode (default: passive)')
+                      help='Compression mode: passive=only if beneficial, '
+                           'aggressive=try more objects, force=always '
+                           '(default: passive)')
 
     bs = parser.add_argument_group('BlueStore')
     bs.add_argument('--wal-db-separate', action='store_true',
@@ -2282,16 +2603,21 @@ Examples:
     wl = parser.add_argument_group('Workload')
     wl.add_argument('--workload', default='mixed',
                     choices=['sequential', 'random', 'mixed'],
-                    help='Workload pattern (default: mixed)')
+                    help='Workload pattern (default: mixed). Note: CPU cost '
+                         'model uses random IOPS; sequential workloads have '
+                         'lower CPU cost per byte in practice')
     wl.add_argument('--rw-ratio', type=float, default=0.7,
-                    help='Read/write ratio 0.0-1.0 (default: 0.7)')
+                    help='Read/write ratio: 0.0=all writes, 1.0=all reads '
+                         '(default: 0.7)')
     wl.add_argument('--scrub', default='daily',
                     choices=['daily', 'weekly', 'disabled'],
                     help='Scrub frequency (default: daily)')
 
     parser.add_argument('--scenario', '-s', default='typical',
                         choices=['best', 'worst', 'typical', 'all'],
-                        help='Scenario (default: typical)')
+                        help='Scenario: best=lowest IOPS/overhead, '
+                             'worst=highest IOPS/overhead, '
+                             'all=run all three (default: typical)')
 
     rec = parser.add_argument_group('Recovery Simulation')
     rec.add_argument('--recovery-osds', type=int, default=0,
@@ -2300,7 +2626,8 @@ Examples:
 
     out = parser.add_argument_group('Output')
     out.add_argument('--output', '-o', default=None,
-                     help='CSV output file')
+                     help='CSV output base file (creates '
+                          '*_benchmarks.csv and *_capacity.csv)')
     out.add_argument('--compare', default=None,
                      help='Compare with ceph-bench.sh CSV results')
     out.add_argument('--json', action='store_true',
@@ -2312,7 +2639,8 @@ Examples:
     bench.add_argument('--sizes', nargs='+',
                        default=['4k', '64k', '128k', '4m'],
                        choices=list(OBJECT_SIZES.keys()),
-                       help='Object sizes to test '
+                       help='Object sizes for micro-benchmarks. '
+                            'The --object-size value is auto-added '
                             '(default: 4k 64k 128k 4m)')
 
     parser.add_argument('--verbose', '-v', action='store_true',
@@ -2323,30 +2651,152 @@ Examples:
     return parser.parse_args()
 
 
+def parse_drives(specs: List[str]) -> List[DeviceClass]:
+    """Parse mixed-media drive specs like '36xhdd', '4xnvme:100000'."""
+    classes = []
+    valid_types = set(DRIVE_PROFILES.keys())
+    for spec in specs:
+        spec = spec.strip().lower()
+        # Format: COUNTxTYPE[:IOPS]
+        if 'x' not in spec:
+            print(f"Error: Invalid drive spec '{spec}'. "
+                  f"Use format COUNTxTYPE (e.g., 36xhdd)")
+            sys.exit(1)
+        count_str, rest = spec.split('x', 1)
+        try:
+            count = int(count_str)
+        except ValueError:
+            print(f"Error: Invalid drive count in '{spec}'")
+            sys.exit(1)
+        if count < 1:
+            print(f"Error: Drive count must be >= 1 in '{spec}'")
+            sys.exit(1)
+
+        iops_override = 0
+        if ':' in rest:
+            dtype, iops_str = rest.split(':', 1)
+            try:
+                iops_override = int(iops_str)
+            except ValueError:
+                print(f"Error: Invalid IOPS in '{spec}'")
+                sys.exit(1)
+        else:
+            dtype = rest
+
+        if dtype not in valid_types:
+            print(f"Error: Unknown drive type '{dtype}' in '{spec}'. "
+                  f"Valid types: {', '.join(sorted(valid_types))}")
+            sys.exit(1)
+
+        classes.append(DeviceClass(
+            drive_type=dtype, count=count, iops_override=iops_override))
+    return classes
+
+
 def parse_protection(spec: str) -> Tuple[str, int, int, int]:
     """Parse protection spec like 'replicated:3' or 'ec:4+2'."""
     spec = spec.strip().lower()
-    if spec.startswith('replicated'):
-        parts = spec.split(':')
-        count = int(parts[1]) if len(parts) > 1 else 3
-        return 'replicated', count, 0, 0
-    elif spec.startswith('ec'):
-        parts = spec.split(':')
-        if len(parts) > 1:
-            km = parts[1].split('+')
-            k = int(km[0])
-            m = int(km[1]) if len(km) > 1 else 2
-            return 'erasure', 0, k, m
+    try:
+        if spec.startswith('replicated'):
+            parts = spec.split(':')
+            count = int(parts[1]) if len(parts) > 1 else 3
+            if count < 1:
+                print(f"Warning: replica count must be >= 1, using 3")
+                count = 3
+            return 'replicated', count, 0, 0
+        elif spec.startswith('ec'):
+            parts = spec.split(':')
+            if len(parts) > 1:
+                km = parts[1].split('+')
+                k = int(km[0])
+                m = int(km[1]) if len(km) > 1 else 2
+                if k < 1:
+                    print(f"Error: EC k (data chunks) must be >= 1, got {k}")
+                    sys.exit(1)
+                if m < 1:
+                    print(f"Error: EC m (parity chunks) must be >= 1, got {m}")
+                    sys.exit(1)
+                return 'erasure', 0, k, m
+    except (ValueError, IndexError) as e:
+        print(f"Error: Invalid protection spec '{spec}': {e}")
+        sys.exit(1)
     return 'replicated', 3, 0, 0
+
+
+def _validate_config(config: ClusterConfig):
+    """Validate configuration values and exit with helpful errors."""
+    errors = []
+
+    if config.drive_count < 1:
+        errors.append("--drive-count must be >= 1")
+
+    if config.drive_iops < 0:
+        errors.append("--drive-iops must be >= 0")
+
+    if not 0.0 <= config.read_write_ratio <= 1.0:
+        errors.append(
+            f"--rw-ratio must be between 0.0 and 1.0, got "
+            f"{config.read_write_ratio}")
+
+    if config.compression_enabled:
+        if not 0.0 <= config.compression_ratio <= 1.0:
+            errors.append(
+                f"--compress-ratio must be between 0.0 and 1.0, got "
+                f"{config.compression_ratio}")
+
+    if config.benchmark_duration <= 0:
+        errors.append("--duration must be > 0")
+
+    if config.recovery_osds < 0:
+        errors.append("--recovery-osds must be >= 0")
+
+    if config.recovery_osds > 0 and config.recovery_osds >= config.drive_count:
+        errors.append(
+            f"--recovery-osds ({config.recovery_osds}) must be less than "
+            f"--drive-count ({config.drive_count}); "
+            f"losing all OSDs means the cluster is down")
+
+    # Ensure --object-size is included in --sizes for accurate capacity modeling
+    if config.object_size not in config.object_sizes_to_test:
+        config.object_sizes_to_test.append(config.object_size)
+        print(f"Note: Added {config.object_size} to benchmark sizes "
+              f"(required for capacity modeling)")
+
+    if errors:
+        for e in errors:
+            print(f"Error: {e}")
+        sys.exit(1)
+
+    # Non-fatal warnings (only after passing validation)
+    if config.recovery_osds > 0:
+        if (config.protection_type == 'replicated' and
+                config.recovery_osds >= config.replica_count):
+            print(f"Warning: losing {config.recovery_osds} OSDs with "
+                  f"replicated:{config.replica_count} means some data is "
+                  f"unrecoverable. Modeling recovery of salvageable PGs.")
+        elif (config.protection_type == 'erasure' and
+              config.recovery_osds > config.ec_m):
+            print(f"Warning: losing {config.recovery_osds} OSDs with "
+                  f"EC {config.ec_k}+{config.ec_m} exceeds parity tolerance. "
+                  f"Some data is unrecoverable. Modeling recovery of "
+                  f"salvageable PGs.")
 
 
 def build_config_from_args(args) -> ClusterConfig:
     config = ClusterConfig()
     config.cpu_cores = args.cpu_cores
     config.cpu_cores_for_ceph = args.cpu_cores_ceph
-    config.drive_type = args.drive_type
-    config.drive_count = args.drive_count
-    config.drive_iops = args.drive_iops
+
+    # Mixed-media: --drives overrides --drive-type/--drive-count
+    if args.drives:
+        config.device_classes = parse_drives(args.drives)
+        # Set primary type to the first class for backward compat
+        config.drive_type = config.device_classes[0].drive_type
+        config.drive_count = config.total_drive_count
+    else:
+        config.drive_type = args.drive_type
+        config.drive_count = args.drive_count
+        config.drive_iops = args.drive_iops
 
     ptype, rep_count, ec_k, ec_m = parse_protection(args.protection)
     config.protection_type = ptype
@@ -2370,6 +2820,8 @@ def build_config_from_args(args) -> ClusterConfig:
     config.benchmark_duration = args.duration
     config.object_sizes_to_test = args.sizes
 
+    _validate_config(config)
+
     return config
 
 
@@ -2385,9 +2837,12 @@ def main():
     if args.interactive:
         config = interactive_config()
     elif args.quick:
-        config = ClusterConfig()
+        config = build_config_from_args(args)
         config.benchmark_duration = 2.0
         config.object_sizes_to_test = ['4k', '4m']
+        # Ensure capacity modeling size is included
+        if config.object_size not in config.object_sizes_to_test:
+            config.object_sizes_to_test.append(config.object_size)
     else:
         config = build_config_from_args(args)
 
@@ -2401,18 +2856,23 @@ def main():
     scenarios = (['best', 'worst', 'typical'] if config.scenario == 'all'
                  else [config.scenario])
 
-    all_results = []
+    # Run benchmarks once -- scenario only affects the capacity model, not
+    # the raw CPU micro-benchmarks.  Reuse results across scenarios.
+    if not args.json:
+        print(f"\n{'=' * 60}")
+        print(f"  Running benchmarks...")
+        print(f"{'=' * 60}")
+    else:
+        print("Running benchmarks...", file=sys.stderr)
+
+    benchmarks = CephBenchmarks(libs, config, verbose=args.verbose)
+    results = benchmarks.run_all()
+
     all_capacities = []
+    json_documents = []
 
     for scenario in scenarios:
         config.scenario = scenario
-
-        print(f"\n{'=' * 60}")
-        print(f"  Running benchmarks (scenario: {scenario})...")
-        print(f"{'=' * 60}")
-
-        benchmarks = CephBenchmarks(libs, config, verbose=args.verbose)
-        results = benchmarks.run_all()
 
         model = OSDCapacityModel(config, results)
         capacity = model.calculate()
@@ -2423,16 +2883,26 @@ def main():
         report = ReportGenerator(config, libs, results, capacity, scale_out)
 
         if args.json:
-            print(report.to_json())
+            json_documents.append(json.loads(report.to_json()))
         else:
             report.print_report()
 
-        output_file = args.output or (
-            f"ceph_cpu_sim_{datetime.now():%Y%m%d_%H%M%S}_{scenario}.csv")
-        report.export_csv(output_file)
+        if args.output:
+            if len(scenarios) > 1:
+                base, ext = os.path.splitext(args.output)
+                output_file = f"{base}_{scenario}{ext}"
+            else:
+                output_file = args.output
+            report.export_csv(output_file)
 
-        all_results.extend(results)
         all_capacities.append(capacity)
+
+    # Emit valid JSON: single object or array depending on scenario count
+    if args.json:
+        if len(json_documents) == 1:
+            print(json.dumps(json_documents[0], indent=2))
+        else:
+            print(json.dumps(json_documents, indent=2))
 
     if args.compare and all_capacities:
         compare_with_real(args.compare, config, all_capacities[-1])

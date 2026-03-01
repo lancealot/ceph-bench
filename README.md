@@ -97,27 +97,30 @@ are available. Libraries are auto-detected with a three-tier fallback strategy.
 CPU Simulator options:
 ```
   --interactive, -i     Interactive guided configuration
-  --quick               Quick benchmark with sensible defaults
+  --quick               Quick benchmark (2s, fewer sizes; honors other flags)
   --drive-type, -t      Drive type: hdd|ssd|nvme (default: hdd)
   --drive-count, -d     Drives per node (default: 12)
-  --drive-iops          Override drive IOPS (0=use profile default)
+  --drive-iops          Override drive IOPS (0=use profile: HDD=150, SSD=50K, NVMe=500K)
+  --drives NxTYPE [..]  Mixed media: e.g. --drives 36xhdd 4xnvme
+                         Format: COUNTxTYPE[:IOPS] (overrides --drive-type/count)
   --protection, -p      Protection: replicated:N or ec:K+M (default: replicated:3)
   --compress, -c        Enable compression: snappy|zstd|lz4|zlib
-  --compress-ratio      Expected compression ratio (default: 0.5)
+  --compress-ratio      Expected compression ratio 0.0-1.0 (default: 0.5)
   --compress-mode       Compression mode: passive|aggressive|force (default: passive)
   --wal-db-separate     WAL/DB on separate fast device
   --object-size         RADOS object size (default: 4m)
   --workload            Workload pattern: sequential|random|mixed (default: mixed)
-  --rw-ratio            Read/write ratio 0.0-1.0 (default: 0.7)
+  --rw-ratio            Read/write ratio: 0.0=all writes, 1.0=all reads (default: 0.7)
   --scrub               Scrub frequency: daily|weekly|disabled (default: daily)
   --scenario, -s        Scenario: best|worst|typical|all (default: typical)
-  --output, -o          CSV output file
+  --recovery-osds       Simulate N OSD failures for recovery CPU analysis
+  --output, -o          CSV output base file (creates *_benchmarks.csv and *_capacity.csv)
   --compare             Compare with ceph-bench.sh CSV results
-  --json                Output results as JSON
-  --duration            Seconds per benchmark (default: 5.0)
-  --sizes               Object sizes to test (default: 4k 64k 128k 4m)
+  --json                Output results as JSON (valid JSON, supports --scenario all)
+  --duration            Seconds per benchmark operation (default: 5.0)
+  --sizes               Object sizes for micro-benchmarks (default: 4k 64k 128k 4m)
   --cpu-cores           Total CPU cores (0=auto-detect)
-  --cpu-cores-ceph      CPU cores reserved for Ceph (0=auto)
+  --cpu-cores-ceph      CPU cores reserved for Ceph (0=auto: total minus 2)
   --verbose, -v         Verbose output
 ```
 
@@ -132,11 +135,37 @@ Example usage:
 # NVMe cluster with EC and compression
 ./ceph-cpu-io-sim.py --drive-type nvme --drive-count 4 --protection ec:4+2 --compress zstd
 
+# Mixed media: 36 HDDs for data + 4 NVMe for CephFS metadata
+./ceph-cpu-io-sim.py --drives 36xhdd 4xnvme --wal-db-separate
+
+# Mixed media with IOPS overrides
+./ceph-cpu-io-sim.py --drives 36xhdd:150 4xnvme:10000 --recovery-osds 1
+
 # Compare simulation with real benchmark results
 ./ceph-cpu-io-sim.py --drive-type hdd --compare ceph_bench_results.csv
 
 # Run all scenarios for capacity planning
 ./ceph-cpu-io-sim.py --drive-type ssd --drive-count 8 --scenario all
+
+# Simulate recovery with 1 OSD failure, JSON output
+./ceph-cpu-io-sim.py --drive-type hdd --drive-count 36 --recovery-osds 1 --json
+
+# Quick test with NVMe to get CPU scaling advice
+./ceph-cpu-io-sim.py --quick --drive-type nvme --drive-count 4
+```
+
+Report sections:
+- **Benchmark Results**: Raw CPU micro-benchmark performance
+- **CPU Cost Per IO**: Weighted cost breakdown by operation
+- **OSD Capacity Estimate**: Max OSDs the CPU can sustain
+- **Scale-Out Projection**: Cluster performance at 1-64 nodes
+- **Recovery Impact Analysis**: CPU impact during OSD failure recovery (with --recovery-osds)
+- **CPU Scaling Analysis**: Whether to add more cores or get faster cores
+- **Recommendations**: Actionable advice for the configuration
+
+Running tests:
+```
+python3 -m unittest test_ceph_cpu_io_sim -v
 ```
 
 Dependencies:
