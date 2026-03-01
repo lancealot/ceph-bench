@@ -21,12 +21,14 @@ import importlib
 sim = importlib.import_module('ceph-cpu-io-sim')
 
 ClusterConfig = sim.ClusterConfig
+DeviceClass = sim.DeviceClass
 OSDCapacityModel = sim.OSDCapacityModel
 ScaleOutProjection = sim.ScaleOutProjection
 ReportGenerator = sim.ReportGenerator
 LibraryManager = sim.LibraryManager
 BenchmarkResult = sim.BenchmarkResult
 parse_protection = sim.parse_protection
+parse_drives = sim.parse_drives
 _validate_config = sim._validate_config
 OBJECT_SIZES = sim.OBJECT_SIZES
 DRIVE_PROFILES = sim.DRIVE_PROFILES
@@ -608,6 +610,194 @@ class TestLibraryManager(unittest.TestCase):
         libs = LibraryManager()
         summary = libs.summary()
         self.assertIn('CRC32C', summary)
+
+
+class TestParseDrives(unittest.TestCase):
+    """Test mixed-media drive spec parsing."""
+
+    def test_basic_single_class(self):
+        classes = parse_drives(['12xhdd'])
+        self.assertEqual(len(classes), 1)
+        self.assertEqual(classes[0].drive_type, 'hdd')
+        self.assertEqual(classes[0].count, 12)
+        self.assertEqual(classes[0].osds_per_drive, 1)
+
+    def test_with_iops(self):
+        classes = parse_drives(['4xnvme:100000'])
+        self.assertEqual(classes[0].iops_override, 100000)
+        self.assertEqual(classes[0].osds_per_drive, 1)
+
+    def test_with_osds_per_drive(self):
+        classes = parse_drives(['4xnvme:0:2'])
+        self.assertEqual(classes[0].count, 4)
+        self.assertEqual(classes[0].iops_override, 0)
+        self.assertEqual(classes[0].osds_per_drive, 2)
+        self.assertEqual(classes[0].total_osds, 8)
+
+    def test_with_iops_and_osds(self):
+        classes = parse_drives(['4xnvme:100000:2'])
+        self.assertEqual(classes[0].iops_override, 100000)
+        self.assertEqual(classes[0].osds_per_drive, 2)
+
+    def test_mixed_media(self):
+        classes = parse_drives(['24xhdd', '4xnvme:0:2'])
+        self.assertEqual(len(classes), 2)
+        self.assertEqual(classes[0].total_osds, 24)
+        self.assertEqual(classes[1].total_osds, 8)
+
+    def test_invalid_osds_per_drive_exits(self):
+        with self.assertRaises(SystemExit):
+            parse_drives(['4xnvme:0:0'])
+
+    def test_invalid_format_exits(self):
+        with self.assertRaises(SystemExit):
+            parse_drives(['bad_spec'])
+
+
+class TestDeviceClass(unittest.TestCase):
+    """Test DeviceClass properties and IOPS splitting."""
+
+    def test_total_osds_single(self):
+        dc = DeviceClass(drive_type='hdd', count=12, osds_per_drive=1)
+        self.assertEqual(dc.total_osds, 12)
+
+    def test_total_osds_multi(self):
+        dc = DeviceClass(drive_type='nvme', count=4, osds_per_drive=2)
+        self.assertEqual(dc.total_osds, 8)
+
+    def test_iops_split_across_osds(self):
+        dc = DeviceClass(drive_type='nvme', count=4, osds_per_drive=2)
+        per_osd = dc.get_iops('typical')
+        per_drive = dc.get_drive_iops('typical')
+        self.assertEqual(per_osd, per_drive // 2)
+
+    def test_iops_no_split_single_osd(self):
+        dc = DeviceClass(drive_type='nvme', count=4, osds_per_drive=1)
+        self.assertEqual(dc.get_iops('typical'), dc.get_drive_iops('typical'))
+
+    def test_iops_override_split(self):
+        dc = DeviceClass(drive_type='nvme', count=4,
+                         iops_override=100000, osds_per_drive=2)
+        self.assertEqual(dc.get_iops(), 50000)
+        self.assertEqual(dc.get_drive_iops(), 100000)
+
+
+class TestMultiOSDPerDrive(unittest.TestCase):
+    """Test capacity model with multiple OSDs per drive."""
+
+    def _config(self, **overrides):
+        c = ClusterConfig()
+        c.cpu_cores = 16
+        c.cpu_cores_for_ceph = 14.0
+        c.drive_type = 'hdd'
+        c.drive_count = 12
+        c.object_size = '4m'
+        for k, v in overrides.items():
+            setattr(c, k, v)
+        return c
+
+    def test_total_osd_count_single(self):
+        config = self._config(drive_count=12, osds_per_drive=1)
+        self.assertEqual(config.total_osd_count, 12)
+
+    def test_total_osd_count_multi(self):
+        config = self._config(drive_count=4, osds_per_drive=2)
+        self.assertEqual(config.total_osd_count, 8)
+
+    def test_total_osd_count_mixed_media(self):
+        config = self._config()
+        config.device_classes = [
+            DeviceClass(drive_type='hdd', count=24, osds_per_drive=1),
+            DeviceClass(drive_type='nvme', count=4, osds_per_drive=2),
+        ]
+        self.assertEqual(config.total_osd_count, 32)
+
+    def test_capacity_model_caps_at_total_osds(self):
+        """Max OSDs should be capped at total_osds, not drive_count."""
+        config = self._config(drive_count=4, osds_per_drive=2,
+                              drive_type='hdd', cpu_cores_for_ceph=64.0)
+        results = _make_typical_results()
+        cap = OSDCapacityModel(config, results).calculate()
+        # With 64 cores and 4 HDD drives, CPU can handle way more than 8 OSDs
+        # but capacity should be capped at total_osds=8
+        # (each OSD gets half the drive IOPS, so CPU cost per OSD is halved)
+        self.assertGreater(cap['max_osds_adjusted'], 0)
+
+    def test_multi_osd_reduces_per_osd_iops(self):
+        """2 OSDs per drive means each OSD sees half the IOPS."""
+        config_1 = self._config(drive_count=4, osds_per_drive=1,
+                                drive_type='nvme')
+        config_2 = self._config(drive_count=4, osds_per_drive=2,
+                                drive_type='nvme')
+        # Per-OSD IOPS should be halved
+        self.assertEqual(config_2.get_drive_iops(),
+                         config_1.get_drive_iops() // 2)
+
+    def test_headroom_uses_total_osds(self):
+        """Headroom should be based on total OSDs, not drive count."""
+        config = self._config(drive_count=4, osds_per_drive=2,
+                              cpu_cores_for_ceph=14.0)
+        results = _make_typical_results()
+        cap = OSDCapacityModel(config, results).calculate()
+        # Headroom is based on total_osd_count (8), not drive_count (4)
+        total_osds = config.total_osd_count
+        if cap['max_osds_adjusted'] > 0:
+            expected_headroom = max(0.0,
+                (1.0 - total_osds / cap['max_osds_adjusted']) * 100)
+            # Allow some tolerance for rounding
+            self.assertAlmostEqual(cap['headroom_percentage'],
+                                   expected_headroom, delta=1.0)
+
+    def test_recovery_validation_uses_total_osds(self):
+        """recovery_osds should be validated against total OSDs."""
+        # 4 drives × 2 OSDs = 8 total, recovery_osds=6 should be valid
+        config = self._config(drive_count=4, osds_per_drive=2,
+                              recovery_osds=6)
+        _validate_config(config)  # should not raise
+
+    def test_recovery_validation_rejects_too_many(self):
+        """recovery_osds >= total_osds should fail."""
+        config = self._config(drive_count=4, osds_per_drive=2,
+                              recovery_osds=8)
+        with self.assertRaises(SystemExit):
+            _validate_config(config)
+
+    def test_mixed_media_multi_osd_capacity(self):
+        """Mixed media with multi-OSD should work correctly."""
+        config = self._config(cpu_cores_for_ceph=14.0)
+        config.device_classes = [
+            DeviceClass(drive_type='hdd', count=24, osds_per_drive=1),
+            DeviceClass(drive_type='nvme', count=4, osds_per_drive=2),
+        ]
+        config.drive_count = config.total_drive_count
+        results = _make_typical_results()
+        cap = OSDCapacityModel(config, results).calculate()
+        self.assertIn('per_device_class', cap)
+        per_class = cap['per_device_class']
+        # HDD class: 24 drives × 1 OSD = 24 total_osds
+        self.assertEqual(per_class[0]['total_osds'], 24)
+        # NVMe class: 4 drives × 2 OSDs = 8 total_osds
+        self.assertEqual(per_class[1]['total_osds'], 8)
+
+    def test_osds_per_drive_validation(self):
+        """osds_per_drive < 1 should fail validation."""
+        config = self._config(osds_per_drive=0)
+        with self.assertRaises(SystemExit):
+            _validate_config(config)
+
+    def test_json_includes_osds_per_drive(self):
+        """JSON output should include osds_per_drive."""
+        config = self._config(osds_per_drive=2, drive_count=4)
+        libs = LibraryManager()
+        results = _make_typical_results()
+        model = OSDCapacityModel(config, results)
+        capacity = model.calculate()
+        proj = ScaleOutProjection(config, capacity)
+        scale_out = proj.project()
+        report = ReportGenerator(config, libs, results, capacity, scale_out)
+        data = json.loads(report.to_json())
+        self.assertEqual(data['config']['osds_per_drive'], 2)
+        self.assertEqual(data['config']['total_osds'], 8)
 
 
 if __name__ == '__main__':

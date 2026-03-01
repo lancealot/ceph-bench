@@ -554,8 +554,31 @@ class DeviceClass:
     drive_type: str = 'hdd'
     count: int = 12
     iops_override: int = 0
+    osds_per_drive: int = 1
+
+    @property
+    def total_osds(self) -> int:
+        """Total OSD daemons for this device class."""
+        return self.count * self.osds_per_drive
 
     def get_iops(self, scenario: str = 'typical') -> int:
+        """Get per-OSD IOPS (drive IOPS split across OSDs on same drive)."""
+        if self.iops_override > 0:
+            raw_iops = self.iops_override
+        else:
+            profile = DRIVE_PROFILES[self.drive_type]
+            if scenario == 'best':
+                raw_iops = profile['random_iops_min']
+            elif scenario == 'worst':
+                raw_iops = profile['random_iops_max']
+            else:
+                raw_iops = profile['random_iops_typical']
+        # When multiple OSDs share a drive, each OSD gets a fraction
+        # of the drive's IOPS capacity
+        return raw_iops // self.osds_per_drive if self.osds_per_drive > 1 else raw_iops
+
+    def get_drive_iops(self, scenario: str = 'typical') -> int:
+        """Get raw per-drive IOPS (before splitting across OSDs)."""
         if self.iops_override > 0:
             return self.iops_override
         profile = DRIVE_PROFILES[self.drive_type]
@@ -577,6 +600,7 @@ class ClusterConfig:
     drive_count: int = 12
     drive_iops: int = 0
     drive_throughput_mb: int = 0
+    osds_per_drive: int = 1
 
     # Mixed-media support: list of device classes.
     # When populated, overrides drive_type / drive_count / drive_iops.
@@ -612,15 +636,20 @@ class ClusterConfig:
         return OBJECT_SIZES.get(self.object_size, 4194304)
 
     def get_drive_iops(self) -> int:
+        """Get per-OSD IOPS (split across OSDs sharing a drive)."""
         if self.drive_iops > 0:
-            return self.drive_iops
-        profile = DRIVE_PROFILES[self.drive_type]
-        if self.scenario == 'best':
-            return profile['random_iops_min']
-        elif self.scenario == 'worst':
-            return profile['random_iops_max']
+            raw = self.drive_iops
         else:
-            return profile['random_iops_typical']
+            profile = DRIVE_PROFILES[self.drive_type]
+            if self.scenario == 'best':
+                raw = profile['random_iops_min']
+            elif self.scenario == 'worst':
+                raw = profile['random_iops_max']
+            else:
+                raw = profile['random_iops_typical']
+        if self.osds_per_drive > 1:
+            return raw // self.osds_per_drive
+        return raw
 
     def get_drive_throughput_mb(self) -> int:
         if self.drive_throughput_mb > 0:
@@ -639,6 +668,7 @@ class ClusterConfig:
             drive_type=self.drive_type,
             count=self.drive_count,
             iops_override=self.drive_iops,
+            osds_per_drive=self.osds_per_drive,
         )]
 
     @property
@@ -646,6 +676,13 @@ class ClusterConfig:
         if self.device_classes:
             return sum(dc.count for dc in self.device_classes)
         return self.drive_count
+
+    @property
+    def total_osd_count(self) -> int:
+        """Total OSD daemons across all drives (accounts for multi-OSD)."""
+        if self.device_classes:
+            return sum(dc.total_osds for dc in self.device_classes)
+        return self.drive_count * self.osds_per_drive
 
 
 # ---------------------------------------------------------------------------
@@ -889,7 +926,7 @@ class CephBenchmarks:
             notes=f'{KV_OPS_PER_IO} KV ops per IO')
 
     def _bench_crush_calculation(self):
-        num_osds = max(self.config.drive_count * 8, 64)
+        num_osds = max(self.config.total_osd_count * 8, 64)
         if self.config.protection_type == 'replicated':
             placements = self.config.replica_count
         else:
@@ -955,7 +992,7 @@ class CephBenchmarks:
             pg_id = struct.unpack('<I', data[:4])[0]
             for rep in range(self.config.replica_count):
                 best = -1
-                for osd in range(max(self.config.drive_count * 8, 64)):
+                for osd in range(max(self.config.total_osd_count * 8, 64)):
                     h = zlib.crc32(struct.pack('<III', pg_id, osd, rep))
                     if h > best:
                         best = h
@@ -1007,7 +1044,7 @@ class CephBenchmarks:
             pg_id = struct.unpack('<I', data[:4])[0]
             for rep in range(k + m):
                 best = -1
-                for osd in range(max(self.config.drive_count * 8, 64)):
+                for osd in range(max(self.config.total_osd_count * 8, 64)):
                     h = zlib.crc32(struct.pack('<III', pg_id, osd, rep))
                     if h > best:
                         best = h
@@ -1054,23 +1091,29 @@ class OSDCapacityModel:
         total_cpu_used_us = 0.0
 
         for dc in device_classes:
+            # Per-OSD IOPS (split across OSDs sharing a drive)
             dc_iops = dc.get_iops(self.config.scenario)
             cpu_per_osd_sec = total_cpu_us_per_io * dc_iops
-            cpu_total_class = dc.count * cpu_per_osd_sec * overhead
+            # Total CPU for ALL OSDs in this class
+            cpu_total_class = dc.total_osds * cpu_per_osd_sec * overhead
 
             if cpu_per_osd_sec > 0:
                 max_osds_raw = available_cpu_us / (cpu_per_osd_sec * overhead)
             else:
                 max_osds_raw = float('inf')
 
-            max_osds_adj = (min(math.floor(max_osds_raw), dc.count)
+            # Cap at total OSD daemons (drives × OSDs-per-drive)
+            max_osds_adj = (min(math.floor(max_osds_raw), dc.total_osds)
                             if not math.isinf(max_osds_raw)
-                            else dc.count)
+                            else dc.total_osds)
 
             entry = {
                 'drive_type': dc.drive_type,
                 'drive_count': dc.count,
+                'osds_per_drive': dc.osds_per_drive,
+                'total_osds': dc.total_osds,
                 'drive_iops': dc_iops,
+                'drive_iops_raw': dc.get_drive_iops(self.config.scenario),
                 'cpu_us_per_osd_per_sec': cpu_per_osd_sec,
                 'cpu_total_us_sec': cpu_total_class,
                 'max_osds_standalone': max_osds_adj,
@@ -1096,16 +1139,17 @@ class OSDCapacityModel:
             cpu_per_osd = entry['cpu_us_per_osd_per_sec'] * overhead
             if cpu_per_osd > 0:
                 max_from_budget = remaining_cpu / cpu_per_osd
-                osds = min(entry['drive_count'], math.floor(max_from_budget))
+                osds = min(entry['total_osds'], math.floor(max_from_budget))
                 osds = max(0, osds)
             else:
-                osds = entry['drive_count']
+                osds = entry['total_osds']
             entry['max_osds_shared'] = osds
-            entry['cpu_limited'] = osds < entry['drive_count']
+            entry['cpu_limited'] = osds < entry['total_osds']
             remaining_cpu -= osds * cpu_per_osd * (1 if cpu_per_osd > 0 else 0)
 
         total_shared_osds = sum(e['max_osds_shared'] for e in per_class)
         total_drives = sum(e['drive_count'] for e in per_class)
+        total_osds_wanted = sum(e['total_osds'] for e in per_class)
 
         # For single-class backward compat, also compute simple numbers
         drive_iops = self.config.get_drive_iops()
@@ -1151,6 +1195,7 @@ class OSDCapacityModel:
             result['per_device_class'] = per_class
             result['total_shared_osds'] = total_shared_osds
             result['total_drives'] = total_drives
+            result['total_osds_wanted'] = total_osds_wanted
 
         if self.config.recovery_osds > 0:
             result['recovery'] = self._compute_recovery_impact(
@@ -1178,7 +1223,7 @@ class OSDCapacityModel:
         update metadata).
         """
         recovery_osds = self.config.recovery_osds
-        total_osds = self.config.drive_count
+        total_osds = self.config.total_osd_count
 
         # Get the recovery benchmark result
         recovery_key = ('recovery_ec' if self.config.protection_type == 'erasure'
@@ -1289,10 +1334,10 @@ class OSDCapacityModel:
         parallelizable work) and computes how many cores are needed at
         various target configurations.
         """
-        drives = self.config.drive_count
+        drives = self.config.total_osd_count
         costs = dict(self._cpu_costs)
 
-        # Cores needed to support all configured drives
+        # Cores needed to support all configured OSDs
         cpu_per_osd_per_sec = cpu_us_per_io * drive_iops
         if cpu_per_osd_per_sec > 0:
             cores_needed_all_drives = (
@@ -1538,7 +1583,7 @@ class OSDCapacityModel:
     def _compute_headroom(self, max_osds: float) -> float:
         if max_osds <= 0:
             return 0.0
-        used_fraction = self.config.drive_count / max_osds
+        used_fraction = self.config.total_osd_count / max_osds
         return max(0.0, (1.0 - used_fraction) * 100)
 
 
@@ -1576,12 +1621,12 @@ class ScaleOutProjection:
                     any_limited = True
             osds_per_node = sum(e['max_osds_shared'] for e in per_class_data)
         else:
-            osds_per_node = min(self.config.drive_count,
+            osds_per_node = min(self.config.total_osd_count,
                                 max(self.capacity['max_osds_adjusted'], 0))
             total_osds = osds_per_node * node_count
             drive_iops = self.config.get_drive_iops()
             total_iops = total_osds * drive_iops
-            any_limited = (self.config.drive_count >
+            any_limited = (self.config.total_osd_count >
                            self.capacity['max_osds_adjusted'])
 
         if self.config.protection_type == 'replicated':
@@ -1685,12 +1730,20 @@ class ReportGenerator:
             print("Drive Config: Mixed media")
             for dc in self.config.device_classes:
                 iops = dc.get_iops(self.config.scenario)
+                osd_info = (f" ({dc.osds_per_drive} OSDs/drive)"
+                            if dc.osds_per_drive > 1 else "")
                 print(f"  {dc.count}x {dc.drive_type.upper():>4} @ "
-                      f"{iops:>10,} IOPS ({self.config.scenario})")
+                      f"{iops:>10,} IOPS/OSD ({self.config.scenario})"
+                      f"{osd_info}")
             print(f"Total Drives: {self.config.total_drive_count} per node")
+            if self.config.total_osd_count != self.config.total_drive_count:
+                print(f"Total OSDs:   {self.config.total_osd_count} per node")
         else:
             print(f"Drive Type:   {self.config.drive_type.upper()}")
             print(f"Drive Count:  {self.config.drive_count} per node")
+            if self.config.osds_per_drive > 1:
+                print(f"OSDs/Drive:   {self.config.osds_per_drive}")
+                print(f"Total OSDs:   {self.config.total_osd_count} per node")
             print(f"Drive IOPS:   {self.config.get_drive_iops():,} "
                   f"({self.config.scenario} profile)")
 
@@ -1786,17 +1839,22 @@ class ReportGenerator:
                   f"{cap['max_osds_adjusted']}")
             print(f"Drives configured:     "
                   f"{self.config.drive_count}")
+            if self.config.osds_per_drive > 1:
+                print(f"OSDs per drive:        "
+                      f"{self.config.osds_per_drive}")
+                print(f"Total OSDs:            "
+                      f"{self.config.total_osd_count}")
 
             headroom = cap['headroom_percentage']
             if headroom > 0:
                 print(f"CPU headroom:          {headroom:.1f}%")
             else:
-                over = ((self.config.drive_count /
+                over = ((self.config.total_osd_count /
                          max(cap['max_osds_adjusted'], 0.01) - 1) * 100)
                 print(f"CPU headroom:          NEGATIVE "
                       f"({over:.0f}% overprovisioned)")
 
-            if cap['max_osds_adjusted'] < self.config.drive_count:
+            if cap['max_osds_adjusted'] < self.config.total_osd_count:
                 print()
                 print("!! WARNING: CPU cannot sustain all configured "
                       "drives at expected IOPS.")
@@ -1813,28 +1871,51 @@ class ReportGenerator:
         print(f"Overhead multiplier:   {overhead:.2f}x")
         print()
 
-        header = (f"{'Type':>6} {'Count':>6} {'IOPS/drv':>10} "
-                  f"{'CPU/OSD/s':>12} {'Alone':>6} {'Shared':>7} "
-                  f"{'CPU Ltd':>8}")
+        # Check if any class has multi-OSD-per-drive
+        any_multi_osd = any(e.get('osds_per_drive', 1) > 1 for e in per_class)
+
+        if any_multi_osd:
+            header = (f"{'Type':>6} {'Drives':>6} {'OSD/drv':>7} "
+                      f"{'OSDs':>5} {'IOPS/OSD':>10} "
+                      f"{'CPU/OSD/s':>12} {'Alone':>6} {'Shared':>7} "
+                      f"{'CPU Ltd':>8}")
+        else:
+            header = (f"{'Type':>6} {'Count':>6} {'IOPS/OSD':>10} "
+                      f"{'CPU/OSD/s':>12} {'Alone':>6} {'Shared':>7} "
+                      f"{'CPU Ltd':>8}")
         print(header)
         print("-" * len(header))
         for entry in per_class:
             dtype = entry['drive_type'].upper()
             count = entry['drive_count']
+            opd = entry.get('osds_per_drive', 1)
+            total = entry.get('total_osds', count)
             iops = entry['drive_iops']
             cpu_sec = entry['cpu_us_per_osd_per_sec']
             alone = entry['max_osds_standalone']
             shared = entry['max_osds_shared']
             limited = 'YES' if entry['cpu_limited'] else ''
-            print(f"{dtype:>6} {count:>6} {iops:>10,} "
-                  f"{cpu_sec:>12,.0f} {alone:>6} {shared:>7} "
-                  f"{limited:>8}")
+            if any_multi_osd:
+                print(f"{dtype:>6} {count:>6} {opd:>7} "
+                      f"{total:>5} {iops:>10,} "
+                      f"{cpu_sec:>12,.0f} {alone:>6} {shared:>7} "
+                      f"{limited:>8}")
+            else:
+                print(f"{dtype:>6} {count:>6} {iops:>10,} "
+                      f"{cpu_sec:>12,.0f} {alone:>6} {shared:>7} "
+                      f"{limited:>8}")
 
         total_drives = cap.get('total_drives', 0)
+        total_osds_wanted = cap.get('total_osds_wanted', total_drives)
         total_shared = cap.get('total_shared_osds', 0)
         print("-" * len(header))
-        print(f"{'TOTAL':>6} {total_drives:>6} {'':>10} {'':>12} "
-              f"{'':>6} {total_shared:>7}")
+        if any_multi_osd:
+            print(f"{'TOTAL':>6} {total_drives:>6} {'':>7} "
+                  f"{total_osds_wanted:>5} {'':>10} {'':>12} "
+                  f"{'':>6} {total_shared:>7}")
+        else:
+            print(f"{'TOTAL':>6} {total_drives:>6} {'':>10} {'':>12} "
+                  f"{'':>6} {total_shared:>7}")
 
         headroom = cap['headroom_percentage']
         print()
@@ -1936,7 +2017,7 @@ class ReportGenerator:
 
         if max_recovery < max_normal:
             print()
-            if max_recovery < self.config.drive_count - rec['failed_osds']:
+            if max_recovery < self.config.total_osd_count - rec['failed_osds']:
                 print("!! CRITICAL: Recovery overhead pushes CPU beyond "
                       "capacity.")
                 print("   CPU cannot sustain the surviving OSDs during "
@@ -1963,7 +2044,7 @@ class ReportGenerator:
             return
 
         cap = self.capacity
-        drives = self.config.drive_count
+        drives = self.config.total_osd_count
         current_cores = self.config.cpu_cores_for_ceph
         max_osds = cap['max_osds_adjusted']
 
@@ -1977,7 +2058,7 @@ class ReportGenerator:
               f"{current_cores:.0f} cores for Ceph")
         print(f"CPU per OSD:           "
               f"{scaling['cores_per_osd']:.2f} cores/OSD")
-        print(f"Cores for {drives} drives:  "
+        print(f"Cores for {drives} OSDs:    "
               f"{scaling['cores_needed_all_drives']:.1f} cores "
               f"(+20% headroom: {scaling['cores_with_headroom']:.1f})")
         if scaling['cores_recovery'] > 0:
@@ -2058,7 +2139,7 @@ class ReportGenerator:
         print()
         print("--- Faster Clock Speed ---")
         header = (f"{'Clock Speed':<20} {'Cores/OSD':>10} "
-                  f"{'Max OSDs':>10} {'For All Drives':>15}")
+                  f"{'Max OSDs':>10} {'For All OSDs':>15}")
         print(header)
         print("-" * len(header))
         print(f"{'Current':<20} {scaling['cores_per_osd']:>10.2f} "
@@ -2075,20 +2156,20 @@ class ReportGenerator:
         print("=== Recommendations ===")
 
         max_osds = cap['max_osds_adjusted']
-        drives = self.config.drive_count
+        total_osds = self.config.total_osd_count
 
-        if max_osds >= drives * 2:
+        if max_osds >= total_osds * 2:
             print("CPU has ample headroom for this configuration.")
             print("Consider adding more drives or enabling compression "
                   "for better utilization.")
-        elif max_osds >= drives:
+        elif max_osds >= total_osds:
             headroom = cap['headroom_percentage']
-            print(f"CPU can support all {drives} drives with "
+            print(f"CPU can support all {total_osds} OSDs with "
                   f"{headroom:.0f}% headroom.")
             if headroom < 20:
                 print("Headroom is limited. Monitor CPU usage under load.")
         elif max_osds > 0:
-            print(f"CPU can only support {max_osds} of {drives} drives.")
+            print(f"CPU can only support {max_osds} of {total_osds} OSDs.")
             print("Consider:")
             if self.config.compression_enabled:
                 print("  - Disabling or reducing compression")
@@ -2138,6 +2219,7 @@ class ReportGenerator:
             writer = csv.writer(f)
             writer.writerow([
                 'timestamp', 'scenario', 'drive_type', 'drive_count',
+                'osds_per_drive', 'total_osds',
                 'drive_iops', 'protection', 'compression', 'object_size',
                 'cpu_us_per_io', 'max_osds_raw', 'max_osds_adjusted',
                 'overhead_multiplier', 'cpu_headroom_pct'])
@@ -2149,7 +2231,9 @@ class ReportGenerator:
             cap = self.capacity
             writer.writerow([
                 ts, self.config.scenario, self.config.drive_type,
-                self.config.drive_count, cap['drive_iops'], prot, comp,
+                self.config.drive_count, self.config.osds_per_drive,
+                self.config.total_osd_count,
+                cap['drive_iops'], prot, comp,
                 self.config.object_size, f"{cap['cpu_us_per_io']:.2f}",
                 f"{cap['max_osds_raw']:.2f}", cap['max_osds_adjusted'],
                 f"{cap['overhead_multiplier']:.2f}",
@@ -2181,6 +2265,8 @@ class ReportGenerator:
             'config': {
                 'drive_type': self.config.drive_type,
                 'drive_count': self.config.drive_count,
+                'osds_per_drive': self.config.osds_per_drive,
+                'total_osds': self.config.total_osd_count,
                 'drive_iops': self.config.get_drive_iops(),
                 'protection_type': self.config.protection_type,
                 'replica_count': self.config.replica_count,
@@ -2246,7 +2332,10 @@ class ReportGenerator:
                 {
                     'drive_type': dc.drive_type,
                     'count': dc.count,
-                    'iops': dc.get_iops(self.config.scenario),
+                    'osds_per_drive': dc.osds_per_drive,
+                    'total_osds': dc.total_osds,
+                    'iops_per_osd': dc.get_iops(self.config.scenario),
+                    'iops_per_drive': dc.get_drive_iops(self.config.scenario),
                 }
                 for dc in self.config.device_classes
             ]
@@ -2458,6 +2547,9 @@ def interactive_config() -> ClusterConfig:
                                        'hdd')
     config.drive_count = _prompt_int("Drives per node [12]: ", 12)
 
+    config.osds_per_drive = _prompt_int(
+        "OSD daemons per drive [1]: ", 1)
+
     custom_iops = _prompt_input(
         "Custom drive IOPS (0=use profile default) [0]: ", "0")
     try:
@@ -2566,12 +2658,17 @@ Examples:
     drive.add_argument('--drive-iops', type=int, default=0,
                        help='Override drive IOPS (0=use profile: '
                             'HDD=150, SSD=50K, NVMe=500K typical)')
+    drive.add_argument('--osds-per-drive', type=int, default=1,
+                       help='OSD daemons per drive for single-class config '
+                            '(default: 1). Use --drives NxTYPE:IOPS:OSDS '
+                            'for per-class control in mixed media')
     drive.add_argument('--drives', nargs='+', default=None,
                        metavar='NxTYPE',
                        help='Mixed media: specify multiple device classes. '
-                            'Format: COUNTxTYPE[:IOPS]. '
-                            'Example: --drives 36xhdd 4xnvme '
-                            'or --drives 36xhdd:150 4xnvme:100000. '
+                            'Format: COUNTxTYPE[:IOPS[:OSDS_PER_DRIVE]]. '
+                            'Example: --drives 24xhdd 4xnvme:0:2 '
+                            'or --drives 36xhdd:150 4xnvme:100000:2. '
+                            'Use IOPS=0 for profile defaults. '
                             'Overrides --drive-type/--drive-count')
 
     prot = parser.add_argument_group('Data Protection')
@@ -2652,15 +2749,24 @@ Examples:
 
 
 def parse_drives(specs: List[str]) -> List[DeviceClass]:
-    """Parse mixed-media drive specs like '36xhdd', '4xnvme:100000'."""
+    """Parse mixed-media drive specs.
+
+    Format: COUNTxTYPE[:IOPS[:OSDS_PER_DRIVE]]
+    Examples:
+      36xhdd              - 36 HDDs, 1 OSD each
+      4xnvme:100000       - 4 NVMe, custom IOPS, 1 OSD each
+      4xnvme:0:2          - 4 NVMe, default IOPS, 2 OSDs each
+      4xnvme:100000:2     - 4 NVMe, custom IOPS, 2 OSDs each
+    """
     classes = []
     valid_types = set(DRIVE_PROFILES.keys())
     for spec in specs:
         spec = spec.strip().lower()
-        # Format: COUNTxTYPE[:IOPS]
+        # Format: COUNTxTYPE[:IOPS[:OSDS_PER_DRIVE]]
         if 'x' not in spec:
             print(f"Error: Invalid drive spec '{spec}'. "
-                  f"Use format COUNTxTYPE (e.g., 36xhdd)")
+                  f"Use format COUNTxTYPE[:IOPS[:OSDS]] (e.g., 36xhdd, "
+                  f"4xnvme:0:2)")
             sys.exit(1)
         count_str, rest = spec.split('x', 1)
         try:
@@ -2673,13 +2779,25 @@ def parse_drives(specs: List[str]) -> List[DeviceClass]:
             sys.exit(1)
 
         iops_override = 0
+        osds_per_drive = 1
         if ':' in rest:
-            dtype, iops_str = rest.split(':', 1)
-            try:
-                iops_override = int(iops_str)
-            except ValueError:
-                print(f"Error: Invalid IOPS in '{spec}'")
-                sys.exit(1)
+            parts = rest.split(':')
+            dtype = parts[0]
+            if len(parts) >= 2 and parts[1]:
+                try:
+                    iops_override = int(parts[1])
+                except ValueError:
+                    print(f"Error: Invalid IOPS in '{spec}'")
+                    sys.exit(1)
+            if len(parts) >= 3 and parts[2]:
+                try:
+                    osds_per_drive = int(parts[2])
+                except ValueError:
+                    print(f"Error: Invalid OSDs-per-drive in '{spec}'")
+                    sys.exit(1)
+                if osds_per_drive < 1:
+                    print(f"Error: OSDs-per-drive must be >= 1 in '{spec}'")
+                    sys.exit(1)
         else:
             dtype = rest
 
@@ -2689,7 +2807,8 @@ def parse_drives(specs: List[str]) -> List[DeviceClass]:
             sys.exit(1)
 
         classes.append(DeviceClass(
-            drive_type=dtype, count=count, iops_override=iops_override))
+            drive_type=dtype, count=count, iops_override=iops_override,
+            osds_per_drive=osds_per_drive))
     return classes
 
 
@@ -2730,6 +2849,9 @@ def _validate_config(config: ClusterConfig):
     if config.drive_count < 1:
         errors.append("--drive-count must be >= 1")
 
+    if config.osds_per_drive < 1:
+        errors.append("--osds-per-drive must be >= 1")
+
     if config.drive_iops < 0:
         errors.append("--drive-iops must be >= 0")
 
@@ -2750,10 +2872,11 @@ def _validate_config(config: ClusterConfig):
     if config.recovery_osds < 0:
         errors.append("--recovery-osds must be >= 0")
 
-    if config.recovery_osds > 0 and config.recovery_osds >= config.drive_count:
+    total_osds = config.total_osd_count
+    if config.recovery_osds > 0 and config.recovery_osds >= total_osds:
         errors.append(
             f"--recovery-osds ({config.recovery_osds}) must be less than "
-            f"--drive-count ({config.drive_count}); "
+            f"total OSD count ({total_osds}); "
             f"losing all OSDs means the cluster is down")
 
     # Ensure --object-size is included in --sizes for accurate capacity modeling
@@ -2793,10 +2916,12 @@ def build_config_from_args(args) -> ClusterConfig:
         # Set primary type to the first class for backward compat
         config.drive_type = config.device_classes[0].drive_type
         config.drive_count = config.total_drive_count
+        config.osds_per_drive = 1  # per-class control via --drives
     else:
         config.drive_type = args.drive_type
         config.drive_count = args.drive_count
         config.drive_iops = args.drive_iops
+        config.osds_per_drive = args.osds_per_drive
 
     ptype, rep_count, ec_k, ec_m = parse_protection(args.protection)
     config.protection_type = ptype
