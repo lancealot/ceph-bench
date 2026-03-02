@@ -101,8 +101,10 @@ CPU Simulator options:
   --drive-type, -t      Drive type: hdd|ssd|nvme (default: hdd)
   --drive-count, -d     Drives per node (default: 12)
   --drive-iops          Override drive IOPS (0=use profile: HDD=150, SSD=50K, NVMe=500K)
-  --drives NxTYPE [..]  Mixed media: e.g. --drives 36xhdd 4xnvme
-                         Format: COUNTxTYPE[:IOPS] (overrides --drive-type/count)
+  --osds-per-drive      OSD daemons per drive (default: 1)
+  --drives NxTYPE [..]  Mixed media: e.g. --drives 24xhdd 4xnvme:0:2
+                         Format: COUNTxTYPE[:IOPS[:OSDS_PER_DRIVE]]
+                         (overrides --drive-type/count; use IOPS=0 for defaults)
   --protection, -p      Protection: replicated:N or ec:K+M (default: replicated:3)
   --compress, -c        Enable compression: snappy|zstd|lz4|zlib
   --compress-ratio      Expected compression ratio 0.0-1.0 (default: 0.5)
@@ -135,11 +137,14 @@ Example usage:
 # NVMe cluster with EC and compression
 ./ceph-cpu-io-sim.py --drive-type nvme --drive-count 4 --protection ec:4+2 --compress zstd
 
-# Mixed media: 36 HDDs for data + 4 NVMe for CephFS metadata
-./ceph-cpu-io-sim.py --drives 36xhdd 4xnvme --wal-db-separate
+# Mixed media: 24 HDDs for data + 4 NVMe for CephFS metadata (2 OSDs each)
+./ceph-cpu-io-sim.py --drives 24xhdd 4xnvme:0:2 --wal-db-separate
 
 # Mixed media with IOPS overrides
 ./ceph-cpu-io-sim.py --drives 36xhdd:150 4xnvme:10000 --recovery-osds 1
+
+# Single class with multiple OSDs per drive
+./ceph-cpu-io-sim.py --drive-type nvme --drive-count 4 --osds-per-drive 2
 
 # Compare simulation with real benchmark results
 ./ceph-cpu-io-sim.py --drive-type hdd --compare ceph_bench_results.csv
