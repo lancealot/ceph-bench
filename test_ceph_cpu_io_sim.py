@@ -682,6 +682,72 @@ class TestDeviceClass(unittest.TestCase):
         self.assertEqual(dc.get_drive_iops(), 100000)
 
 
+class TestCRC32CCorrection(unittest.TestCase):
+    """Test CRC32C hardware acceleration correction."""
+
+    def test_correction_not_applied_with_hw_crc32c(self):
+        """No correction when hardware CRC32C is available."""
+        config = ClusterConfig()
+        config.cpu_cores = 16
+        config.cpu_cores_for_ceph = 14.0
+        config.object_size = '4m'
+        results = _make_typical_results()
+        libs = LibraryManager()
+        # Force has_hw_crc32c = True by setting available
+        libs.available['crc32c'] = 'crcmod'
+        model = OSDCapacityModel(config, results, libs=libs)
+        cap = model.calculate()
+        self.assertEqual(cap.get('crc32c_correction', 1.0), 1.0)
+
+    def test_correction_applied_without_hw_on_sse42(self):
+        """Correction applied when using zlib fallback on SSE4.2 CPU."""
+        config = ClusterConfig()
+        config.cpu_cores = 16
+        config.cpu_cores_for_ceph = 14.0
+        config.object_size = '4m'
+        results = _make_typical_results()
+        libs = LibraryManager()
+        libs.available['crc32c'] = 'zlib_crc32'
+        libs.cpu_has_sse42 = True
+        model = OSDCapacityModel(config, results, libs=libs)
+        cap = model.calculate()
+        self.assertEqual(cap['crc32c_correction'], 10.0)
+
+    def test_correction_increases_max_osds(self):
+        """With correction, more OSDs should be supportable."""
+        config = ClusterConfig()
+        config.cpu_cores = 16
+        config.cpu_cores_for_ceph = 14.0
+        config.drive_type = 'hdd'
+        config.drive_count = 12
+        config.object_size = '4m'
+        results = _make_typical_results()
+
+        # Without correction
+        libs_no = LibraryManager()
+        libs_no.available['crc32c'] = 'zlib_crc32'
+        libs_no.cpu_has_sse42 = False
+        cap_no = OSDCapacityModel(config, results, libs=libs_no).calculate()
+
+        # With correction
+        libs_yes = LibraryManager()
+        libs_yes.available['crc32c'] = 'zlib_crc32'
+        libs_yes.cpu_has_sse42 = True
+        cap_yes = OSDCapacityModel(config, results, libs=libs_yes).calculate()
+
+        self.assertGreater(cap_yes['max_osds_adjusted'],
+                           cap_no['max_osds_adjusted'])
+
+    def test_library_warnings(self):
+        """Library manager should warn about missing hw CRC32C."""
+        libs = LibraryManager()
+        libs.available['crc32c'] = 'zlib_crc32'
+        libs.cpu_has_sse42 = True
+        warnings = libs.get_warnings()
+        self.assertTrue(any('CRC32C' in w for w in warnings))
+        self.assertTrue(any('SSE4.2' in w for w in warnings))
+
+
 class TestMultiOSDPerDrive(unittest.TestCase):
     """Test capacity model with multiple OSDs per drive."""
 

@@ -105,6 +105,7 @@ class LibraryManager:
         self._detect_libraries()
 
     def _detect_libraries(self):
+        self._detect_cpu_features()
         self._detect_crc32c()
         self._detect_lz4()
         self._detect_zstd()
@@ -114,8 +115,52 @@ class LibraryManager:
         self.available['zlib'] = 'stdlib'
         self.available['sha256'] = 'hashlib'
 
+    def _detect_cpu_features(self):
+        """Detect CPU features relevant to Ceph performance."""
+        self.cpu_has_sse42 = False
+        self.cpu_has_avx2 = False
+        try:
+            with open('/proc/cpuinfo', 'r') as f:
+                for line in f:
+                    if line.startswith('flags'):
+                        flags = line.split(':')[1] if ':' in line else ''
+                        self.cpu_has_sse42 = 'sse4_2' in flags
+                        self.cpu_has_avx2 = 'avx2' in flags
+                        break
+        except (IOError, Exception):
+            pass
+
+    @property
+    def has_hw_crc32c(self) -> bool:
+        """Check if we're using hardware-accelerated CRC32C."""
+        crc_impl = self.available.get('crc32c', '')
+        return crc_impl in ('crcmod', 'crc32c', 'ctypes_isal', 'ctypes_crc32c')
+
+    def get_warnings(self) -> List[str]:
+        """Return warnings about suboptimal library detection."""
+        warnings = []
+        if not self.has_hw_crc32c:
+            msg = ("CRC32C: Using zlib.crc32 fallback (IEEE polynomial, "
+                   "NOT hardware-accelerated CRC32C). Results will "
+                   "SIGNIFICANTLY overestimate CPU cost (~5-10x).")
+            if self.cpu_has_sse42:
+                msg += ("\n   Your CPU supports SSE4.2 hardware CRC32C! "
+                        "Install one of:\n"
+                        "     pip install crc32c    (recommended)\n"
+                        "     pip install crcmod    (alternative)\n"
+                        "     dnf install libisal   (ISA-L library)")
+            warnings.append(msg)
+        ec_impl = self.available.get('erasure_coding', '')
+        if ec_impl == 'xor_simulation':
+            warnings.append(
+                "Erasure coding: Using XOR simulation. EC encode/decode "
+                "benchmarks will not reflect real Reed-Solomon performance. "
+                "Install pyeclib for accurate EC benchmarks.")
+        return warnings
+
     # -- CRC32C --
     def _detect_crc32c(self):
+        # Tier 1: Python packages (hardware-accelerated)
         try:
             import crcmod
             self._crc32c_fn = crcmod.predefined.mkCrcFun('crc-32c')
@@ -130,8 +175,82 @@ class LibraryManager:
             return
         except (ImportError, Exception):
             pass
+
+        # Tier 2: ctypes - try system libraries that provide CRC32C
+        # These use hardware SSE4.2/ARMv8 instructions when available
+        for lib_name, candidates, setup_fn in [
+            ('isal', ['libisal.so.2', 'libisal.so'], '_setup_isal_crc32c'),
+            ('crc32c', ['libcrc32c.so.1', 'libcrc32c.so'], '_setup_libcrc32c'),
+        ]:
+            try:
+                path = ctypes.util.find_library(lib_name)
+                if path is None:
+                    for candidate in candidates:
+                        try:
+                            ctypes.CDLL(candidate)
+                            path = candidate
+                            break
+                        except OSError:
+                            continue
+                if path:
+                    lib = ctypes.CDLL(path)
+                    fn = getattr(self, setup_fn)(lib)
+                    if fn:
+                        self._crc32c_fn = fn
+                        self.available['crc32c'] = f'ctypes_{lib_name}'
+                        return
+            except (OSError, Exception):
+                pass
+
+        # Tier 3: Fallback to zlib.crc32 (WARNING: different polynomial,
+        # not hardware-accelerated -- results will overestimate CPU cost)
         self._crc32c_fn = zlib.crc32
         self.available['crc32c'] = 'zlib_crc32'
+
+    def _setup_isal_crc32c(self, lib):
+        """Setup Intel ISA-L crc32_iscsi (CRC32C Castagnoli)."""
+        try:
+            # isal provides crc32_iscsi which uses CRC32C polynomial
+            fn = lib.crc32_iscsi
+            fn.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_uint]
+            fn.restype = ctypes.c_uint
+            # Verify it works
+            test = fn(b'hello', 5, 0)
+            if isinstance(test, int):
+                def crc32c_isal(data):
+                    return fn(data, len(data), 0)
+                return crc32c_isal
+        except (AttributeError, Exception):
+            pass
+        return None
+
+    def _setup_libcrc32c(self, lib):
+        """Setup Google crc32c library."""
+        try:
+            # Try crc32c_extend (Google CRC32C library)
+            fn = lib.crc32c_extend
+            fn.argtypes = [ctypes.c_uint, ctypes.c_char_p, ctypes.c_size_t]
+            fn.restype = ctypes.c_uint
+            test = fn(0, b'hello', 5)
+            if isinstance(test, int):
+                def crc32c_google(data):
+                    return fn(0, data, len(data))
+                return crc32c_google
+        except (AttributeError, Exception):
+            pass
+        try:
+            # Alternative API: crc32c_value
+            fn = lib.crc32c_value
+            fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+            fn.restype = ctypes.c_uint
+            test = fn(b'hello', 5)
+            if isinstance(test, int):
+                def crc32c_val(data):
+                    return fn(data, len(data))
+                return crc32c_val
+        except (AttributeError, Exception):
+            pass
+        return None
 
     # -- LZ4 --
     def _detect_lz4(self):
@@ -277,7 +396,10 @@ class LibraryManager:
         crc_label = {
             'crcmod': 'crcmod (hardware-accelerated CRC32C)',
             'crc32c': 'crc32c package (Castagnoli)',
-            'zlib_crc32': 'zlib.crc32 (IEEE polynomial, ~same CPU cost)',
+            'ctypes_isal': 'ISA-L (hardware CRC32C via ctypes)',
+            'ctypes_crc32c': 'libcrc32c (hardware CRC32C via ctypes)',
+            'zlib_crc32': ('zlib.crc32 (NOT CRC32C - ~10x slower than '
+                           'hardware! Install crcmod or crc32c package)'),
         }
         lines.append(f"CRC32C:        {crc_label.get(self.available.get('crc32c', ''), 'unknown')}")
 
@@ -891,19 +1013,36 @@ class CephBenchmarks:
             notes=f'k={k} m={m}, 1 missing chunk')
 
     def _bench_serialization(self, data: bytes, size_name: str):
+        """Benchmark OSD replication message framing.
+
+        Models the per-replica cost on the PRIMARY OSD for replication.
+        In real Ceph, the primary:
+        - Encodes an OSD op message header (~100-200 bytes)
+        - CRC32Cs the header (not the data payload -- data goes via
+          zero-copy sendmsg scatter-gather)
+        - The RECEIVING replica CRC32Cs the full data, but that happens
+          on the replica's CPU, not the primary's.
+
+        So we benchmark: header encode + header CRC + small framing CRC.
+        This replaces the old benchmark that incorrectly CRC32C'd the
+        full data payload per replica.
+        """
         crc_fn = self.libs.crc32c
 
         def op():
+            # Encode OSD op message header (MOSDOp-like)
             header = struct.pack('<IIQQQII',
                                  0x0001, len(data), 0x12345678,
                                  0, len(data), 42, 0)
             crc_fn(header)
-            crc_fn(data)
+            # Messenger v2 frame: CRC32C of a ~60-byte frame header
+            frame_hdr = struct.pack('<IIQI', 0x0002, 0, len(data), 0)
+            crc_fn(frame_hdr)
 
         self._run_timed(
             f'serialization_{size_name}', op, len(data),
             self.libs.available.get('crc32c', 'zlib'),
-            notes='replication message encoding')
+            notes='per-replica message framing (header CRC only)')
 
     def _bench_rocksdb_sim(self, size_name: str):
         KV_OPS_PER_IO = 4
@@ -1069,10 +1208,13 @@ class CephBenchmarks:
 class OSDCapacityModel:
     """Calculates how many OSDs a CPU can support based on benchmark results."""
 
-    def __init__(self, config: ClusterConfig, results: List[BenchmarkResult]):
+    def __init__(self, config: ClusterConfig, results: List[BenchmarkResult],
+                 libs: Optional[LibraryManager] = None):
         self.config = config
         self.results = results
+        self.libs = libs
         self._cpu_costs: Dict[str, float] = {}
+        self._crc32c_correction: float = 1.0
 
     def calculate(self) -> Dict[str, Any]:
         self._compute_per_io_cpu_cost()
@@ -1189,6 +1331,7 @@ class OSDCapacityModel:
             'available_cpu_us': available_cpu_us,
             'per_operation_costs': dict(self._cpu_costs),
             'headroom_percentage': headroom,
+            'crc32c_correction': self._crc32c_correction,
         }
 
         if self.config.is_mixed_media:
@@ -1492,6 +1635,20 @@ class OSDCapacityModel:
     def _total_cpu_cost_per_io(self) -> float:
         crc_cost = self._get_cost('crc32c')
 
+        # Apply CRC32C correction when using slow fallback on SSE4.2 CPU.
+        # Real Ceph uses hardware CRC32C (SSE4.2 crc32 instruction) which
+        # is ~8-12x faster than zlib.crc32 (software, different polynomial).
+        # Since we're modeling what real Ceph would do on this CPU, we
+        # correct the CRC32C cost to reflect hardware acceleration.
+        # The serialization benchmark also uses CRC32C internally, so
+        # it benefits from the same correction.
+        if (self.libs and not self.libs.has_hw_crc32c
+                and self.libs.cpu_has_sse42 and crc_cost > 0):
+            # Hardware CRC32C is typically 8-12x faster than software.
+            # Use 10x as a conservative middle estimate.
+            self._crc32c_correction = 10.0
+            crc_cost /= self._crc32c_correction
+
         comp_cost = 0.0
         if self.config.compression_enabled:
             comp_prob = {'passive': 0.3, 'aggressive': 0.7, 'force': 1.0}
@@ -1519,6 +1676,9 @@ class OSDCapacityModel:
                        ec_decode_c * params['ec_recovery_fraction'])
         else:
             serial_c = self._get_cost('serialization')
+            # Apply CRC32C correction to serialization (uses CRC32C internally)
+            if self._crc32c_correction > 1.0:
+                serial_c /= self._crc32c_correction
             ec_cost = (self.config.replica_count - 1) * serial_c
 
         rocksdb_cost = self._get_cost('rocksdb_sim')
@@ -1695,6 +1855,14 @@ class ReportGenerator:
         self._print_system_info()
         print()
         print(self.libs.summary())
+        # Print library warnings (missing hardware CRC32C, etc.)
+        warnings = self.libs.get_warnings()
+        if warnings:
+            print()
+            for w in warnings:
+                for line in w.split('\n'):
+                    print(f"!! WARNING: {line}" if not line.startswith(' ')
+                          else f"  {line}")
         print()
         self._print_config_summary()
         self._print_benchmark_results()
@@ -1811,6 +1979,17 @@ class ReportGenerator:
             total += val
         print("-" * len(header))
         print(f"{'TOTAL':<25} {total:>20,.2f}")
+
+        # Show correction notice if applied
+        correction = self.capacity.get('crc32c_correction', 1.0)
+        if correction > 1.0:
+            print()
+            print(f"Note: CRC32C and serialization costs above reflect "
+                  f"estimated {correction:.0f}x")
+            print(f"hardware acceleration correction (SSE4.2 CRC32C "
+                  f"detected but not benchmarked).")
+            print(f"Install 'pip install crc32c' for accurate measurement "
+                  f"instead of estimation.")
 
     def _print_capacity_estimate(self):
         cap = self.capacity
@@ -2999,7 +3178,7 @@ def main():
     for scenario in scenarios:
         config.scenario = scenario
 
-        model = OSDCapacityModel(config, results)
+        model = OSDCapacityModel(config, results, libs=libs)
         capacity = model.calculate()
 
         projection = ScaleOutProjection(config, capacity)
