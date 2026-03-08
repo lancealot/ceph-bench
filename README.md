@@ -180,6 +180,6 @@ python3 -m unittest test_ceph_cpu_io_sim -v
 
 Dependencies:
   - Python 3.6+
-  - No required external packages (all benchmarks have stdlib fallbacks)
-  - Optional: pyeclib, lz4, pyzstd/zstandard, python-snappy, crcmod,
-    python-rocksdb (for higher accuracy benchmarks)
+  - No required external packages for core benchmarks (CRC32C, SHA256, serialization)
+  - Compression benchmarks require: `pip install lz4 pyzstd python-snappy`
+  - Optional: pyeclib, crcmod, python-rocksdb (for higher accuracy benchmarks)

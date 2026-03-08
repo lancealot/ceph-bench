@@ -97,8 +97,6 @@ class LibraryManager:
 
     def __init__(self):
         self.available = {}
-        self._liblz4 = None
-        self._libzstd = None
         self._crc32c_fn = None
         self._ec_driver = None
         self._kv_store = {}
@@ -260,31 +258,6 @@ class LibraryManager:
             return
         except (ImportError, Exception):
             pass
-        try:
-            path = ctypes.util.find_library('lz4')
-            if path is None:
-                for candidate in ['liblz4.so.1', 'liblz4.so', 'liblz4.dylib']:
-                    try:
-                        lib = ctypes.CDLL(candidate)
-                        path = candidate
-                        break
-                    except OSError:
-                        continue
-            if path:
-                lib = ctypes.CDLL(path)
-                lib.LZ4_compress_default.argtypes = [
-                    ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
-                lib.LZ4_compress_default.restype = ctypes.c_int
-                lib.LZ4_compressBound.argtypes = [ctypes.c_int]
-                lib.LZ4_compressBound.restype = ctypes.c_int
-                lib.LZ4_decompress_safe.argtypes = [
-                    ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
-                lib.LZ4_decompress_safe.restype = ctypes.c_int
-                self._liblz4 = lib
-                self.available['lz4'] = 'ctypes'
-                return
-        except (OSError, Exception):
-            pass
         self.available['lz4'] = None
 
     # -- ZSTD --
@@ -300,35 +273,6 @@ class LibraryManager:
             self.available['zstd'] = 'zstandard'
             return
         except (ImportError, Exception):
-            pass
-        try:
-            path = ctypes.util.find_library('zstd')
-            if path is None:
-                for candidate in ['libzstd.so.1', 'libzstd.so', 'libzstd.dylib']:
-                    try:
-                        lib = ctypes.CDLL(candidate)
-                        path = candidate
-                        break
-                    except OSError:
-                        continue
-            if path:
-                lib = ctypes.CDLL(path)
-                lib.ZSTD_compress.argtypes = [
-                    ctypes.c_void_p, ctypes.c_size_t,
-                    ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-                lib.ZSTD_compress.restype = ctypes.c_size_t
-                lib.ZSTD_compressBound.argtypes = [ctypes.c_size_t]
-                lib.ZSTD_compressBound.restype = ctypes.c_size_t
-                lib.ZSTD_decompress.argtypes = [
-                    ctypes.c_void_p, ctypes.c_size_t,
-                    ctypes.c_void_p, ctypes.c_size_t]
-                lib.ZSTD_decompress.restype = ctypes.c_size_t
-                lib.ZSTD_isError.argtypes = [ctypes.c_size_t]
-                lib.ZSTD_isError.restype = ctypes.c_uint
-                self._libzstd = lib
-                self.available['zstd'] = 'ctypes'
-                return
-        except (OSError, Exception):
             pass
         self.available['zstd'] = None
 
@@ -425,17 +369,8 @@ class LibraryManager:
             if impl == 'python_lz4':
                 import lz4.block
                 return lz4.block.compress(data)
-            elif impl == 'ctypes' and self._liblz4:
-                src = data
-                bound = self._liblz4.LZ4_compressBound(len(src))
-                dst = ctypes.create_string_buffer(bound)
-                result = self._liblz4.LZ4_compress_default(
-                    src, dst, len(src), bound)
-                if result <= 0:
-                    raise RuntimeError("LZ4 compression failed")
-                return dst.raw[:result]
             else:
-                raise RuntimeError("lz4 not available")
+                raise RuntimeError("lz4 not available (pip install lz4)")
 
         if algorithm == 'zstd':
             impl = self.available.get('zstd')
@@ -446,17 +381,8 @@ class LibraryManager:
                 import zstandard
                 cctx = zstandard.ZstdCompressor(level=level if level >= 0 else 1)
                 return cctx.compress(data)
-            elif impl == 'ctypes' and self._libzstd:
-                src = data
-                bound = self._libzstd.ZSTD_compressBound(len(src))
-                dst = ctypes.create_string_buffer(bound)
-                result = self._libzstd.ZSTD_compress(
-                    dst, bound, src, len(src), level if level >= 0 else 1)
-                if self._libzstd.ZSTD_isError(result):
-                    raise RuntimeError("ZSTD compression failed")
-                return bytes(dst.raw[:result])
             else:
-                raise RuntimeError("zstd not available")
+                raise RuntimeError("zstd not available (pip install pyzstd)")
 
         if algorithm == 'snappy':
             impl = self.available.get('snappy')
@@ -478,15 +404,8 @@ class LibraryManager:
             if impl == 'python_lz4':
                 import lz4.block
                 return lz4.block.decompress(data, uncompressed_size=original_size)
-            elif impl == 'ctypes' and self._liblz4:
-                dst = ctypes.create_string_buffer(original_size)
-                result = self._liblz4.LZ4_decompress_safe(
-                    data, dst, len(data), original_size)
-                if result < 0:
-                    raise RuntimeError("LZ4 decompression failed")
-                return dst.raw[:result]
             else:
-                raise RuntimeError("lz4 not available")
+                raise RuntimeError("lz4 not available (pip install lz4)")
 
         if algorithm == 'zstd':
             impl = self.available.get('zstd')
@@ -498,16 +417,8 @@ class LibraryManager:
                 dctx = zstandard.ZstdDecompressor()
                 return dctx.decompress(data, max_output_size=original_size or
                                        len(data) * 20)
-            elif impl == 'ctypes' and self._libzstd:
-                out_size = original_size or len(data) * 10
-                dst = ctypes.create_string_buffer(out_size)
-                result = self._libzstd.ZSTD_decompress(
-                    dst, out_size, data, len(data))
-                if self._libzstd.ZSTD_isError(result):
-                    raise RuntimeError("ZSTD decompression failed")
-                return bytes(dst.raw[:result])
             else:
-                raise RuntimeError("zstd not available")
+                raise RuntimeError("zstd not available (pip install pyzstd)")
 
         if algorithm == 'snappy':
             impl = self.available.get('snappy')
