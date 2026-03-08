@@ -95,9 +95,12 @@ The simulator is currently ~3,549 lines (over its 2,000-line budget). These are 
 7. Rewrite tests — behavioral tests only, cut to ~500 lines (~470 lines saved)
 8. Simplify README — cut to ~120 lines (~65 lines saved)
 
+## Project direction
+
+The simulator (`ceph-cpu-io-sim.py`) and the live benchmark tools (`ceph-bench.sh`, `ceph-analysis.py`) are separate concerns and may be split into separate projects. Do not add integration between them.
+
 ## Remaining roadmap (genuine improvements, after simplification)
 
 1. **Accuracy validation** — Compare predictions vs real Ceph cluster data
 2. **NUMA-aware benchmarking** — Pin workers to NUMA nodes for contention measurement
 3. **Better RocksDB modeling** — More realistic compaction and WAL/DB CPU costs
-4. **Integration with ceph-bench.sh** — Auto-feed real IOPS into the simulator
