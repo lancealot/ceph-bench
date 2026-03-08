@@ -26,6 +26,7 @@ import math
 import multiprocessing
 import os
 import platform
+import statistics
 import struct
 import sys
 import time
@@ -808,6 +809,207 @@ class ClusterConfig:
 
 
 # ---------------------------------------------------------------------------
+# Parallel Benchmark Worker (module-level for pickling)
+# ---------------------------------------------------------------------------
+
+def _make_worker_op(libs: LibraryManager, op_spec: Dict[str, Any]):
+    """Reconstruct a benchmark closure from a serializable spec.
+
+    Each worker process calls this to build the callable that _run_timed
+    would normally create inline.  The spec dict carries the operation
+    name and the parameters needed to reconstruct it.
+    """
+    name = op_spec['op']
+    data = op_spec.get('data', b'')
+    obj_size = op_spec.get('object_size', 0)
+
+    if name == 'crc32c':
+        return lambda: libs.crc32c(data)
+
+    if name == 'sha256':
+        return lambda: hashlib.sha256(data).digest()
+
+    if name == 'compress':
+        algo = op_spec['algo']
+        level = op_spec['level']
+        return lambda: libs.compress(algo, data, level)
+
+    if name == 'decompress':
+        algo = op_spec['algo']
+        compressed = op_spec['compressed']
+        orig_size = op_spec['orig_size']
+        return lambda: libs.decompress(algo, compressed, orig_size)
+
+    if name == 'ec_encode':
+        k, m = op_spec['k'], op_spec['m']
+        return lambda: libs.ec_encode(data, k, m)
+
+    if name == 'ec_decode':
+        k, m = op_spec['k'], op_spec['m']
+        chunks = op_spec['chunks']
+        missing = op_spec['missing']
+        return lambda: libs.ec_decode(chunks, k, m, missing)
+
+    if name == 'serialization':
+        crc_fn = libs.crc32c
+        data_len = op_spec['data_len']
+        def ser_op():
+            header = struct.pack('<IIQQQII',
+                                 0x0001, data_len, 0x12345678,
+                                 0, data_len, 42, 0)
+            crc_fn(header)
+            frame_hdr = struct.pack('<IIQI', 0x0002, 0, data_len, 0)
+            crc_fn(frame_hdr)
+        return ser_op
+
+    if name == 'rocksdb_sim':
+        store = {}
+        counter = [0]
+        kv_ops = op_spec.get('kv_ops', 4)
+        def rdb_op():
+            for i in range(kv_ops):
+                k = struct.pack('>QQ', counter[0], i)
+                v = struct.pack('<QQII',
+                                counter[0] * obj_size, obj_size,
+                                0, zlib.crc32(k))
+                store[k] = v
+            counter[0] += 1
+        return rdb_op
+
+    if name == 'crush':
+        num_osds = op_spec['num_osds']
+        placements = op_spec['placements']
+        seed_data = os.urandom(4096)
+        seed_offset = [0]
+        def crush_op():
+            off = seed_offset[0] % (len(seed_data) - 4)
+            seed_offset[0] += 4
+            pg_id = struct.unpack_from('<I', seed_data, off)[0]
+            for rep in range(placements):
+                best_osd = -1
+                best_hash = -1
+                for osd in range(num_osds):
+                    h = zlib.crc32(struct.pack('<III', pg_id, osd, rep))
+                    if h > best_hash:
+                        best_hash = h
+                        best_osd = osd
+        return crush_op
+
+    if name == 'recovery_replicated':
+        crc_fn = libs.crc32c
+        replica_count = op_spec['replica_count']
+        total_osds = op_spec['total_osds']
+        store = {}
+        counter = [0]
+        def rec_rep_op():
+            crc_fn(data)
+            header = struct.pack('<IIQQQII',
+                                 0x0002, len(data), 0x12345678,
+                                 0, len(data), 42, 0)
+            crc_fn(header)
+            crc_fn(data)
+            crc_fn(data)
+            for i in range(6):
+                k = struct.pack('>QQ', counter[0], i)
+                v = struct.pack('<QQII', counter[0] * len(data),
+                                len(data), 0, zlib.crc32(k))
+                store[k] = v
+            counter[0] += 1
+            pg_id = struct.unpack('<I', data[:4])[0]
+            for rep in range(replica_count):
+                best = -1
+                for osd in range(max(total_osds * 8, 64)):
+                    h = zlib.crc32(struct.pack('<III', pg_id, osd, rep))
+                    if h > best:
+                        best = h
+        return rec_rep_op
+
+    if name == 'recovery_ec':
+        crc_fn = libs.crc32c
+        k, m = op_spec['k'], op_spec['m']
+        chunks = op_spec['chunks']
+        missing = op_spec['missing']
+        total_osds = op_spec['total_osds']
+        store = {}
+        counter = [0]
+        def rec_ec_op():
+            for i in range(k + m):
+                if i not in missing and i < len(chunks):
+                    crc_fn(chunks[i])
+            libs.ec_decode(chunks, k, m, missing)
+            libs.ec_encode(data, k, m)
+            crc_fn(chunks[0])
+            for i in range(8):
+                key = struct.pack('>QQ', counter[0], i)
+                val = struct.pack('<QQII', counter[0] * len(data),
+                                  len(data), 0, zlib.crc32(key))
+                store[key] = val
+            counter[0] += 1
+            pg_id = struct.unpack('<I', data[:4])[0]
+            for rep in range(k + m):
+                best = -1
+                for osd in range(max(total_osds * 8, 64)):
+                    h = zlib.crc32(struct.pack('<III', pg_id, osd, rep))
+                    if h > best:
+                        best = h
+        return rec_ec_op
+
+    raise ValueError(f"Unknown operation: {name}")
+
+
+def _benchmark_worker(op_spec: Dict[str, Any], iterations: int,
+                      duration: float) -> Dict[str, Any]:
+    """Worker process: runs one benchmark and returns timing results.
+
+    Each worker creates its own LibraryManager (separate process =
+    separate GIL, separate library handles). This is a module-level
+    function so multiprocessing can pickle it.
+    """
+    libs = LibraryManager()
+
+    # Reconstruct random data if needed (can't share across processes)
+    obj_size = op_spec.get('object_size', 0)
+    if obj_size > 0 and 'data' not in op_spec:
+        op_spec['data'] = os.urandom(obj_size)
+
+    op = _make_worker_op(libs, op_spec)
+
+    # Warm up
+    for _ in range(3):
+        op()
+
+    # If no pre-calibrated iteration count, calibrate locally
+    if iterations <= 0:
+        start = time.perf_counter()
+        for _ in range(10):
+            op()
+        elapsed = time.perf_counter() - start
+        per_op = elapsed / 10
+        iterations = max(100, int(duration / per_op)) if per_op > 0 else 100000
+
+    start_cpu = time.process_time()
+    start_wall = time.perf_counter()
+    for _ in range(iterations):
+        op()
+    end_wall = time.perf_counter()
+    end_cpu = time.process_time()
+
+    elapsed = max(end_wall - start_wall, 1e-9)
+    cpu_time = max(end_cpu - start_cpu, 1e-9)
+
+    return {
+        'iterations': iterations,
+        'elapsed_sec': elapsed,
+        'cpu_time_sec': cpu_time,
+        'ops_per_sec': iterations / elapsed,
+        'cpu_time_per_op_us': (cpu_time / iterations) * 1e6,
+        'throughput_mbps': (obj_size * iterations / elapsed / (1024 * 1024)
+                            if obj_size > 0 else 0.0),
+        'cpu_utilization': cpu_time / elapsed,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CPU Micro-Benchmarks
 # ---------------------------------------------------------------------------
 
@@ -815,10 +1017,11 @@ class CephBenchmarks:
     """Runs CPU micro-benchmarks simulating Ceph OSD operations."""
 
     def __init__(self, libs: LibraryManager, config: ClusterConfig,
-                 verbose: bool = False):
+                 verbose: bool = False, parallel_workers: int = 0):
         self.libs = libs
         self.config = config
         self.verbose = verbose
+        self.parallel_workers = parallel_workers
         self.results: List[BenchmarkResult] = []
 
     def run_all(self) -> List[BenchmarkResult]:
@@ -944,19 +1147,98 @@ class CephBenchmarks:
         self.results.append(result)
         return result
 
+    def _run_parallel(self, name: str, op_spec: Dict[str, Any],
+                      object_size: int, library_used: str,
+                      notes: str = '') -> BenchmarkResult:
+        """Run benchmark across parallel workers to measure contention.
+
+        Each worker simulates one OSD running the same operation.
+        Results are averaged to get per-OSD cost under contention.
+        """
+        n = self.parallel_workers
+
+        # Calibrate in parent process, broadcast iteration count
+        iterations = 0
+        if object_size > 0 and 'data' not in op_spec:
+            op_spec['data'] = os.urandom(object_size)
+        try:
+            op = _make_worker_op(self.libs, op_spec)
+            iterations = self._calibrate_iterations(op)
+        except Exception:
+            pass
+
+        # Build per-worker args (each worker regenerates its own data)
+        worker_specs = []
+        for _ in range(n):
+            spec = dict(op_spec)
+            # Remove data so each worker generates its own random buffer
+            spec.pop('data', None)
+            spec['object_size'] = object_size
+            worker_specs.append(
+                (spec, iterations, self.config.benchmark_duration))
+
+        with multiprocessing.Pool(n) as pool:
+            worker_results = pool.starmap(_benchmark_worker, worker_specs)
+
+        # Aggregate: mean and P99
+        cpu_times = [r['cpu_time_per_op_us'] for r in worker_results]
+        ops_rates = [r['ops_per_sec'] for r in worker_results]
+        throughputs = [r['throughput_mbps'] for r in worker_results]
+        cpu_utils = [r['cpu_utilization'] for r in worker_results]
+        iters = [r['iterations'] for r in worker_results]
+
+        avg_cpu = statistics.mean(cpu_times)
+        avg_ops = statistics.mean(ops_rates)
+        avg_tp = statistics.mean(throughputs)
+        avg_util = statistics.mean(cpu_utils)
+        total_iters = sum(iters)
+
+        p99_cpu = sorted(cpu_times)[int(len(cpu_times) * 0.99)] if len(cpu_times) > 1 else cpu_times[0]
+
+        parallel_notes = (f'{notes}; ' if notes else '') + f'{n} workers, P99={p99_cpu:.2f}us'
+
+        elapsed = statistics.mean([r['elapsed_sec'] for r in worker_results])
+
+        result = BenchmarkResult(
+            operation=name,
+            object_size=object_size,
+            ops_per_sec=avg_ops,
+            cpu_time_per_op_us=avg_cpu,
+            throughput_mbps=avg_tp,
+            cpu_utilization=avg_util,
+            iterations=total_iters,
+            elapsed_sec=elapsed,
+            library_used=library_used,
+            notes=parallel_notes,
+        )
+        self.results.append(result)
+        return result
+
+    def _run_op(self, name: str, op_spec: Dict[str, Any],
+                object_size: int, library_used: str,
+                func=None, notes: str = '') -> BenchmarkResult:
+        """Dispatch to parallel or single-threaded benchmark."""
+        if self.parallel_workers >= 2:
+            return self._run_parallel(
+                name, op_spec, object_size, library_used, notes)
+        else:
+            return self._run_timed(name, func, object_size, library_used, notes)
+
     def _bench_crc32c(self, data: bytes, size_name: str):
         def op():
             self.libs.crc32c(data)
-        self._run_timed(
-            f'crc32c_{size_name}', op, len(data),
-            self.libs.available.get('crc32c', 'zlib'))
+        op_spec = {'op': 'crc32c', 'object_size': len(data)}
+        self._run_op(
+            f'crc32c_{size_name}', op_spec, len(data),
+            self.libs.available.get('crc32c', 'zlib'), func=op)
 
     def _bench_sha256(self, data: bytes, size_name: str):
         def op():
             hashlib.sha256(data).digest()
-        self._run_timed(
-            f'sha256_{size_name}', op, len(data), 'hashlib',
-            notes='deep scrub verification')
+        op_spec = {'op': 'sha256', 'object_size': len(data)}
+        self._run_op(
+            f'sha256_{size_name}', op_spec, len(data), 'hashlib',
+            func=op, notes='deep scrub verification')
 
     def _bench_compress(self, data: bytes, size_name: str, algo: str):
         comp_data = self._generate_compressible_data(
@@ -966,10 +1248,12 @@ class CephBenchmarks:
         def op():
             self.libs.compress(algo, comp_data, level)
 
-        self._run_timed(
-            f'compress_{algo}_{size_name}', op, len(comp_data),
+        op_spec = {'op': 'compress', 'algo': algo, 'level': level,
+                   'object_size': len(comp_data), 'data': comp_data}
+        self._run_op(
+            f'compress_{algo}_{size_name}', op_spec, len(comp_data),
             self.libs.available.get(algo, 'unknown'),
-            notes=f'ratio={self.config.compression_ratio}')
+            func=op, notes=f'ratio={self.config.compression_ratio}')
 
     def _bench_decompress(self, data: bytes, size_name: str, algo: str):
         comp_data = self._generate_compressible_data(
@@ -984,9 +1268,12 @@ class CephBenchmarks:
         def op():
             self.libs.decompress(algo, compressed, original_size)
 
-        self._run_timed(
-            f'decompress_{algo}_{size_name}', op, original_size,
-            self.libs.available.get(algo, 'unknown'))
+        op_spec = {'op': 'decompress', 'algo': algo,
+                   'compressed': compressed, 'orig_size': original_size,
+                   'object_size': original_size}
+        self._run_op(
+            f'decompress_{algo}_{size_name}', op_spec, original_size,
+            self.libs.available.get(algo, 'unknown'), func=op)
 
     def _bench_ec_encode(self, data: bytes, size_name: str):
         k, m = self.config.ec_k, self.config.ec_m
@@ -994,10 +1281,12 @@ class CephBenchmarks:
         def op():
             self.libs.ec_encode(data, k, m)
 
-        self._run_timed(
-            f'ec_encode_{k}_{m}_{size_name}', op, len(data),
+        op_spec = {'op': 'ec_encode', 'k': k, 'm': m,
+                   'object_size': len(data)}
+        self._run_op(
+            f'ec_encode_{k}_{m}_{size_name}', op_spec, len(data),
             self.libs.available.get('erasure_coding', 'xor'),
-            notes=f'k={k} m={m}')
+            func=op, notes=f'k={k} m={m}')
 
     def _bench_ec_decode(self, data: bytes, size_name: str):
         k, m = self.config.ec_k, self.config.ec_m
@@ -1007,10 +1296,13 @@ class CephBenchmarks:
         def op():
             self.libs.ec_decode(chunks, k, m, missing)
 
-        self._run_timed(
-            f'ec_decode_{k}_{m}_{size_name}', op, len(data),
+        op_spec = {'op': 'ec_decode', 'k': k, 'm': m,
+                   'chunks': chunks, 'missing': missing,
+                   'object_size': len(data)}
+        self._run_op(
+            f'ec_decode_{k}_{m}_{size_name}', op_spec, len(data),
             self.libs.available.get('erasure_coding', 'xor'),
-            notes=f'k={k} m={m}, 1 missing chunk')
+            func=op, notes=f'k={k} m={m}, 1 missing chunk')
 
     def _bench_serialization(self, data: bytes, size_name: str):
         """Benchmark OSD replication message framing.
@@ -1039,10 +1331,12 @@ class CephBenchmarks:
             frame_hdr = struct.pack('<IIQI', 0x0002, 0, len(data), 0)
             crc_fn(frame_hdr)
 
-        self._run_timed(
-            f'serialization_{size_name}', op, len(data),
+        op_spec = {'op': 'serialization', 'data_len': len(data),
+                   'object_size': len(data)}
+        self._run_op(
+            f'serialization_{size_name}', op_spec, len(data),
             self.libs.available.get('crc32c', 'zlib'),
-            notes='per-replica message framing (header CRC only)')
+            func=op, notes='per-replica message framing (header CRC only)')
 
     def _bench_rocksdb_sim(self, size_name: str):
         KV_OPS_PER_IO = 4
@@ -1059,10 +1353,12 @@ class CephBenchmarks:
                 store[k] = v
             counter[0] += 1
 
-        self._run_timed(
-            f'rocksdb_sim_{size_name}', op, 0,
+        op_spec = {'op': 'rocksdb_sim', 'kv_ops': KV_OPS_PER_IO,
+                   'object_size': obj_size}
+        self._run_op(
+            f'rocksdb_sim_{size_name}', op_spec, 0,
             self.libs.available.get('rocksdb', 'dict_simulation'),
-            notes=f'{KV_OPS_PER_IO} KV ops per IO')
+            func=op, notes=f'{KV_OPS_PER_IO} KV ops per IO')
 
     def _bench_crush_calculation(self):
         num_osds = max(self.config.total_osd_count * 8, 64)
@@ -1089,9 +1385,11 @@ class CephBenchmarks:
                         best_osd = osd
                 selected.append(best_osd)
 
-        self._run_timed(
-            'crush_calculation', op, 0, 'simulation',
-            notes=f'{placements} placements across {num_osds} OSDs')
+        op_spec = {'op': 'crush', 'num_osds': num_osds,
+                   'placements': placements}
+        self._run_op(
+            'crush_calculation', op_spec, 0, 'simulation',
+            func=op, notes=f'{placements} placements across {num_osds} OSDs')
 
     def _bench_recovery_replicated(self, data: bytes):
         """Benchmark full replicated recovery pipeline per object.
@@ -1136,9 +1434,14 @@ class CephBenchmarks:
                     if h > best:
                         best = h
 
-        self._run_timed(
-            'recovery_replicated', op, obj_size,
+        op_spec = {'op': 'recovery_replicated',
+                   'replica_count': self.config.replica_count,
+                   'total_osds': self.config.total_osd_count,
+                   'object_size': obj_size}
+        self._run_op(
+            'recovery_replicated', op_spec, obj_size,
             self.libs.available.get('crc32c', 'zlib'),
+            func=op,
             notes=f'full pipeline: read+verify+serialize+write+metadata+CRUSH')
 
     def _bench_recovery_ec(self, data: bytes):
@@ -1188,9 +1491,15 @@ class CephBenchmarks:
                     if h > best:
                         best = h
 
-        self._run_timed(
-            'recovery_ec', op, obj_size,
+        op_spec = {'op': 'recovery_ec',
+                   'k': k, 'm': m,
+                   'chunks': chunks, 'missing': missing,
+                   'total_osds': self.config.total_osd_count,
+                   'object_size': obj_size}
+        self._run_op(
+            'recovery_ec', op_spec, obj_size,
             self.libs.available.get('erasure_coding', 'xor'),
+            func=op,
             notes=f'full pipeline: read_k+decode+re-encode+verify+metadata+CRUSH')
 
     @staticmethod
@@ -1940,7 +2249,20 @@ class ReportGenerator:
 
     def _print_benchmark_results(self):
         print()
-        print("=== Benchmark Results ===")
+        # Detect parallel mode from result notes
+        parallel_n = 0
+        for r in self.bench_results:
+            if 'workers' in r.notes:
+                import re
+                m = re.search(r'(\d+) workers', r.notes)
+                if m:
+                    parallel_n = int(m.group(1))
+                    break
+
+        if parallel_n > 0:
+            print(f"=== Benchmark Results ({parallel_n} parallel workers) ===")
+        else:
+            print("=== Benchmark Results ===")
         header = (f"{'Operation':<35} {'Size':>6} {'Ops/sec':>12} "
                   f"{'CPU us/op':>12} {'Throughput':>14} {'Library':<18}")
         print(header)
@@ -2918,6 +3240,13 @@ Examples:
                        help='Object sizes for micro-benchmarks. '
                             'The --object-size value is auto-added '
                             '(default: 4k 64k 128k 4m)')
+    bench.add_argument('--parallel', type=int, default=0,
+                       metavar='N',
+                       help='Run benchmarks across N parallel workers to '
+                            'measure CPU contention effects (default: 0 = '
+                            'single-threaded). Simulates N OSD daemons '
+                            'competing for CPU. Recommended: set to your '
+                            'total OSD count')
 
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Verbose output')
@@ -3169,7 +3498,11 @@ def main():
     else:
         print("Running benchmarks...", file=sys.stderr)
 
-    benchmarks = CephBenchmarks(libs, config, verbose=args.verbose)
+    parallel = getattr(args, 'parallel', 0)
+    benchmarks = CephBenchmarks(libs, config, verbose=args.verbose,
+                                parallel_workers=parallel)
+    if parallel >= 2 and not args.json:
+        print(f"  Parallel mode: {parallel} workers")
     results = benchmarks.run_all()
 
     all_capacities = []

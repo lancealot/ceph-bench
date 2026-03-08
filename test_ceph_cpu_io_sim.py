@@ -866,5 +866,103 @@ class TestMultiOSDPerDrive(unittest.TestCase):
         self.assertEqual(data['config']['total_osds'], 8)
 
 
+CephBenchmarks = sim.CephBenchmarks
+_benchmark_worker = sim._benchmark_worker
+_make_worker_op = sim._make_worker_op
+
+
+class TestParallelBenchmarks(unittest.TestCase):
+    """Tests for parallel benchmark execution via multiprocessing."""
+
+    def test_benchmark_worker_basic(self):
+        """_benchmark_worker runs and returns valid timing dict."""
+        op_spec = {'op': 'crc32c', 'object_size': 4096}
+        result = _benchmark_worker(op_spec, iterations=100, duration=1.0)
+        self.assertIn('cpu_time_per_op_us', result)
+        self.assertIn('ops_per_sec', result)
+        self.assertIn('iterations', result)
+        self.assertGreater(result['cpu_time_per_op_us'], 0)
+        self.assertGreater(result['ops_per_sec'], 0)
+        self.assertEqual(result['iterations'], 100)
+
+    def test_benchmark_worker_auto_calibrate(self):
+        """Worker auto-calibrates when iterations=0."""
+        op_spec = {'op': 'crc32c', 'object_size': 4096}
+        result = _benchmark_worker(op_spec, iterations=0, duration=0.5)
+        self.assertGreater(result['iterations'], 0)
+        self.assertGreater(result['ops_per_sec'], 0)
+
+    def test_make_worker_op_all_types(self):
+        """_make_worker_op handles all known operation types."""
+        libs = LibraryManager()
+        data = os.urandom(4096)
+
+        # crc32c
+        op = _make_worker_op(libs, {'op': 'crc32c', 'data': data})
+        op()  # should not raise
+
+        # sha256
+        op = _make_worker_op(libs, {'op': 'sha256', 'data': data})
+        op()
+
+        # serialization
+        op = _make_worker_op(libs, {'op': 'serialization', 'data_len': 4096})
+        op()
+
+        # rocksdb_sim
+        op = _make_worker_op(libs, {'op': 'rocksdb_sim', 'kv_ops': 4,
+                                     'object_size': 4096})
+        op()
+
+        # crush
+        op = _make_worker_op(libs, {'op': 'crush', 'num_osds': 64,
+                                     'placements': 3})
+        op()
+
+    def test_make_worker_op_unknown_raises(self):
+        """Unknown operation name raises ValueError."""
+        libs = LibraryManager()
+        with self.assertRaises(ValueError):
+            _make_worker_op(libs, {'op': 'nonexistent'})
+
+    def test_parallel_workers_stored(self):
+        """CephBenchmarks stores parallel_workers parameter."""
+        libs = LibraryManager()
+        config = ClusterConfig()
+        config.object_sizes_to_test = ['4k']
+        config.benchmark_duration = 0.5
+        bench = CephBenchmarks(libs, config, parallel_workers=4)
+        self.assertEqual(bench.parallel_workers, 4)
+
+    def test_parallel_zero_uses_single_thread(self):
+        """parallel_workers=0 (default) runs single-threaded benchmarks."""
+        libs = LibraryManager()
+        config = ClusterConfig()
+        config.object_sizes_to_test = ['4k']
+        config.benchmark_duration = 0.5
+        bench = CephBenchmarks(libs, config, parallel_workers=0)
+        results = bench.run_all()
+        self.assertGreater(len(results), 0)
+        # No "workers" in notes means single-threaded
+        for r in results:
+            self.assertNotIn('workers', r.notes)
+
+    def test_parallel_run_produces_results(self):
+        """parallel_workers=2 produces results with worker info in notes."""
+        libs = LibraryManager()
+        config = ClusterConfig()
+        config.object_sizes_to_test = ['4k']
+        config.benchmark_duration = 0.5
+        bench = CephBenchmarks(libs, config, parallel_workers=2)
+        results = bench.run_all()
+        self.assertGreater(len(results), 0)
+        # All results should have parallel worker info in notes
+        for r in results:
+            self.assertIn('2 workers', r.notes)
+            self.assertIn('P99=', r.notes)
+            self.assertGreater(r.cpu_time_per_op_us, 0)
+            self.assertGreater(r.ops_per_sec, 0)
+
+
 if __name__ == '__main__':
     unittest.main()
