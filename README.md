@@ -119,6 +119,8 @@ CPU Simulator options:
   --output, -o          CSV output base file (creates *_benchmarks.csv and *_capacity.csv)
   --compare             Compare with ceph-bench.sh CSV results
   --json                Output results as JSON (valid JSON, supports --scenario all)
+  --parallel            Run benchmarks with N parallel workers to measure CPU
+                         contention (simulates N OSD daemons competing for CPU)
   --duration            Seconds per benchmark operation (default: 5.0)
   --sizes               Object sizes for micro-benchmarks (default: 4k 64k 128k 4m)
   --cpu-cores           Total CPU cores (0=auto-detect)
@@ -157,6 +159,9 @@ Example usage:
 
 # Quick test with NVMe to get CPU scaling advice
 ./ceph-cpu-io-sim.py --quick --drive-type nvme --drive-count 4
+
+# Benchmark under contention (simulate 32 OSD daemons competing for CPU)
+./ceph-cpu-io-sim.py --drives 24xhdd 4xnvme:0:2 --parallel 32 --wal-db-separate
 ```
 
 Report sections:
