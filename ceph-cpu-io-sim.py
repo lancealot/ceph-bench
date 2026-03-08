@@ -99,7 +99,6 @@ class LibraryManager:
         self.available = {}
         self._liblz4 = None
         self._libzstd = None
-        self._libsnappy = None
         self._crc32c_fn = None
         self._ec_driver = None
         self._kv_store = {}
@@ -341,23 +340,6 @@ class LibraryManager:
             return
         except (ImportError, Exception):
             pass
-        try:
-            path = ctypes.util.find_library('snappy')
-            if path is None:
-                for candidate in ['libsnappy.so.1', 'libsnappy.so', 'libsnappy.dylib']:
-                    try:
-                        lib = ctypes.CDLL(candidate)
-                        path = candidate
-                        break
-                    except OSError:
-                        continue
-            if path:
-                lib = ctypes.CDLL(path)
-                self._libsnappy = lib
-                self.available['snappy'] = 'ctypes'
-                return
-        except (OSError, Exception):
-            pass
         self.available['snappy'] = None
 
     # -- Erasure Coding --
@@ -481,10 +463,8 @@ class LibraryManager:
             if impl == 'python_snappy':
                 import snappy
                 return snappy.compress(data)
-            elif impl == 'ctypes' and self._libsnappy:
-                raise RuntimeError("snappy ctypes compress not fully implemented")
             else:
-                raise RuntimeError("snappy not available")
+                raise RuntimeError("snappy not available (pip install python-snappy)")
 
         raise ValueError(f"Unknown compression algorithm: {algorithm}")
 
@@ -535,7 +515,7 @@ class LibraryManager:
                 import snappy
                 return snappy.decompress(data)
             else:
-                raise RuntimeError("snappy not available")
+                raise RuntimeError("snappy not available (pip install python-snappy)")
 
         raise ValueError(f"Unknown decompression algorithm: {algorithm}")
 
